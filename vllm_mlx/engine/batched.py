@@ -40,7 +40,7 @@ def _extract_media_from_messages(messages: list[dict[str, Any]]) -> tuple:
         for item in content:
             # Handle Pydantic models
             if hasattr(item, "model_dump"):
-                item = item.model_dump()
+                item = item.model_dump(exclude_none=True)
             elif hasattr(item, "dict"):
                 item = item.dict()
 
