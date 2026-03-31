@@ -1732,6 +1732,59 @@ async def count_anthropic_tokens(request: Request):
     return {"input_tokens": total_tokens}
 
 
+def _emit_content_pieces(
+    pieces: list[tuple[str, str]],
+    current_block_type: str | None,
+    block_index: int,
+) -> tuple[list[str], str | None, int]:
+    """Emit Anthropic SSE events for content pieces from the think router.
+
+    Handles block type transitions (thinking <-> text), emitting
+    content_block_start/stop/delta events as needed.
+
+    Args:
+        pieces: List of (block_type, text) from StreamingThinkRouter
+        current_block_type: Current open block type, or None
+        block_index: Current block index
+
+    Returns:
+        Tuple of (events, updated_block_type, updated_block_index)
+    """
+    events = []
+    for block_type, text in pieces:
+        if block_type != current_block_type:
+            # Close previous block if open
+            if current_block_type is not None:
+                events.append(
+                    f"event: content_block_stop\ndata: "
+                    f"{json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+                )
+                block_index += 1
+            # Start new block
+            current_block_type = block_type
+            content_block = (
+                {"type": block_type, "text": ""}
+                if block_type == "text"
+                else {"type": block_type, "thinking": ""}
+            )
+            events.append(
+                f"event: content_block_start\ndata: "
+                f"{json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': content_block})}\n\n"
+            )
+        # Emit delta
+        delta_key = "thinking" if block_type == "thinking" else "text"
+        delta_type = "thinking_delta" if block_type == "thinking" else "text_delta"
+        delta_event = {
+            "type": "content_block_delta",
+            "index": block_index,
+            "delta": {"type": delta_type, delta_key: text},
+        }
+        events.append(
+            f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+        )
+    return events, current_block_type, block_index
+
+
 async def _stream_anthropic_messages(
     engine: BaseEngine,
     openai_request: ChatCompletionRequest,
@@ -1823,57 +1876,28 @@ async def _stream_anthropic_messages(
                     continue
                 # Stage 2: route thinking vs text
                 pieces = think_router.process(filtered)
-                for block_type, text in pieces:
-                    if block_type != current_block_type:
-                        # Close previous block if open
-                        if current_block_type is not None:
-                            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
-                            block_index += 1
-                        # Start new block
-                        current_block_type = block_type
-                        content_block = {"type": block_type, "text": ""} if block_type == "text" else {"type": block_type, "thinking": ""}
-                        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': content_block})}\n\n"
-                    # Emit delta
-                    if block_type == "thinking":
-                        delta_event = {
-                            "type": "content_block_delta",
-                            "index": block_index,
-                            "delta": {"type": "thinking_delta", "thinking": text},
-                        }
-                    else:
-                        delta_event = {
-                            "type": "content_block_delta",
-                            "index": block_index,
-                            "delta": {"type": "text_delta", "text": text},
-                        }
-                    yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+                events, current_block_type, block_index = _emit_content_pieces(
+                    pieces, current_block_type, block_index
+                )
+                for event in events:
+                    yield event
 
     # Flush remaining from both filters
     remaining = tool_filter.flush()
     if remaining:
-        for block_type, text in think_router.process(remaining):
-            if block_type != current_block_type:
-                if current_block_type is not None:
-                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
-                    block_index += 1
-                current_block_type = block_type
-                content_block = {"type": block_type, "text": ""} if block_type == "text" else {"type": block_type, "thinking": ""}
-                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': content_block})}\n\n"
-            delta_key = "thinking" if block_type == "thinking" else "text"
-            delta_type = "thinking_delta" if block_type == "thinking" else "text_delta"
-            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': delta_type, delta_key: text}})}\n\n"
+        events, current_block_type, block_index = _emit_content_pieces(
+            think_router.process(remaining), current_block_type, block_index
+        )
+        for event in events:
+            yield event
 
-    for block_type, text in think_router.flush():
-        if block_type != current_block_type:
-            if current_block_type is not None:
-                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
-                block_index += 1
-            current_block_type = block_type
-            content_block = {"type": block_type, "text": ""} if block_type == "text" else {"type": block_type, "thinking": ""}
-            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': content_block})}\n\n"
-        delta_key = "thinking" if block_type == "thinking" else "text"
-        delta_type = "thinking_delta" if block_type == "thinking" else "text_delta"
-        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': delta_type, delta_key: text}})}\n\n"
+    flush_pieces = think_router.flush()
+    if flush_pieces:
+        events, current_block_type, block_index = _emit_content_pieces(
+            flush_pieces, current_block_type, block_index
+        )
+        for event in events:
+            yield event
 
     # Close final content block
     if current_block_type is not None:
