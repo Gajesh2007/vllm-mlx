@@ -104,7 +104,7 @@ from .api.utils import (
     extract_multimodal_content,
     is_mllm_model,  # noqa: F401
 )
-from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
+from .engine import AdaptiveEngine, BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
 from .tool_parsers import ToolParserManager
 
 logging.basicConfig(level=logging.INFO)
@@ -529,12 +529,10 @@ def load_model(
             stream_interval=stream_interval,
             force_mllm=force_mllm,
         )
-        # BatchedEngine will be started in lifespan (uvicorn's event loop)
-        # Just log for now
         logger.info(f"Model loaded (batched mode): {model_name}")
     else:
-        logger.info(f"Loading model with SimpleEngine: {model_name}")
-        _engine = SimpleEngine(
+        logger.info(f"Loading model with AdaptiveEngine (SimpleEngine + request queuing): {model_name}")
+        simple = SimpleEngine(
             model_name=model_name,
             force_mllm=force_mllm,
             mtp=mtp,
@@ -544,13 +542,12 @@ def load_model(
             specprefill_keep_pct=specprefill_keep_pct,
             specprefill_draft_model=specprefill_draft_model,
         )
-        # Start SimpleEngine synchronously (no background loop)
-        # Use new_event_loop() for Python 3.10+ compatibility (get_event_loop() is deprecated)
+        _engine = AdaptiveEngine(simple)
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(_engine.start())
         model_type = "MLLM" if _engine.is_mllm else "LLM"
-        logger.info(f"{model_type} model loaded (simple mode): {model_name}")
+        logger.info(f"{model_type} model loaded (adaptive mode): {model_name}")
 
     # Set native tool format support on the engine (thread-safe via instance property)
     _engine.preserve_native_tool_format = _detect_native_tool_support()
