@@ -405,6 +405,7 @@ class AutoToolParser(ToolParser):
         # Check for any tool call markers
         markers = [
             "<|tool_call>",
+            "<minimax:tool_call>",
             self.MISTRAL_TOKEN,
             "[Calling tool:",
             "<tool_call>",
@@ -417,7 +418,7 @@ class AutoToolParser(ToolParser):
             return {"content": delta_text}
 
         # Check for completion markers
-        end_markers = ["<tool_call|>", "</tool_call>", "</function>", ")]"]
+        end_markers = ["<tool_call|>", "</minimax:tool_call>", "</tool_call>", "</function>", ")]"]
         if any(m in delta_text for m in end_markers):
             result = self.extract_tool_calls(current_text)
             if result.tools_called:
