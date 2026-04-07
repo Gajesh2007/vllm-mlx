@@ -2350,6 +2350,29 @@ Examples:
         default=0,
         help="Rate limit requests per minute per client (0 = disabled)",
     )
+    # Tool call parsing options
+    parser.add_argument(
+        "--enable-auto-tool-choice",
+        action="store_true",
+        help="Enable automatic tool call detection and parsing from model output",
+    )
+    tool_parser_choices = [
+        "auto", "mistral", "qwen", "qwen3_coder", "llama", "hermes",
+        "deepseek", "kimi", "granite", "nemotron", "xlam", "functionary",
+        "glm47", "gemma4",
+    ]
+    parser.add_argument(
+        "--tool-call-parser",
+        type=str,
+        default=None,
+        choices=tool_parser_choices,
+        help=(
+            "Select the tool call parser for the model. "
+            f"Options: {', '.join(tool_parser_choices)}. "
+            "Required for --enable-auto-tool-choice."
+        ),
+    )
+
     # Reasoning parser options - choices loaded dynamically from registry
     from .reasoning import list_parsers
 
@@ -2420,6 +2443,13 @@ Examples:
     # Set MCP config for lifespan
     if args.mcp_config:
         os.environ["VLLM_MLX_MCP_CONFIG"] = args.mcp_config
+
+    # Initialize tool call parser if specified
+    if args.enable_auto_tool_choice:
+        global _enable_auto_tool_choice, _tool_call_parser
+        _enable_auto_tool_choice = True
+        _tool_call_parser = args.tool_call_parser or "auto"
+        logger.info(f"Tool call parsing enabled: {_tool_call_parser}")
 
     # Initialize reasoning parser if specified
     if args.reasoning_parser:
