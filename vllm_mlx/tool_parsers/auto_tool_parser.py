@@ -32,12 +32,13 @@ class AutoToolParser(ToolParser):
 
     Tries multiple formats in order:
     1. Gemma 4: <|tool_call>call:name{...}<tool_call|>
-    2. Mistral: [TOOL_CALLS] ...
-    3. Qwen bracket: [Calling tool: func_name({...})]
-    4. Qwen/Hermes XML: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
-    5. Llama: <function=name>{"arg": "value"}</function>
-    6. Nemotron: <tool_call><function=name>...</function></tool_call>
-    7. Raw JSON: {"name": "...", "arguments": {...}}
+    2. MiniMax: <minimax:tool_call><invoke name="fn"><parameter name="k">v</parameter></invoke></minimax:tool_call>
+    3. Mistral: [TOOL_CALLS] ...
+    4. Qwen bracket: [Calling tool: func_name({...})]
+    5. Qwen/Hermes XML: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+    6. Llama: <function=name>{"arg": "value"}</function>
+    7. Nemotron: <tool_call><function=name>...</function></tool_call>
+    8. Raw JSON: {"name": "...", "arguments": {...}}
 
     This is the default parser when no specific parser is selected.
     """
@@ -55,6 +56,16 @@ class AutoToolParser(ToolParser):
     )
     NEMOTRON_PARAM_PATTERN = re.compile(
         r"<parameter=([^>]+)>\s*(.*?)\s*</parameter>", re.DOTALL
+    )
+    # MiniMax M2.5: <minimax:tool_call><invoke name="fn"><parameter name="k">v</parameter></invoke></minimax:tool_call>
+    MINIMAX_BLOCK_PATTERN = re.compile(
+        r"<minimax:tool_call>(.*?)</minimax:tool_call>", re.DOTALL
+    )
+    MINIMAX_INVOKE_PATTERN = re.compile(
+        r'<invoke\s+name="([^"]+)">(.*?)</invoke>', re.DOTALL
+    )
+    MINIMAX_PARAM_PATTERN = re.compile(
+        r'<parameter\s+name="([^"]+)">(.*?)</parameter>', re.DOTALL
     )
 
     def extract_tool_calls(
@@ -100,7 +111,36 @@ class AutoToolParser(ToolParser):
                     content=cleaned_text if cleaned_text else None,
                 )
 
-        # 2. Try Mistral format
+        # 2. Try MiniMax format: <minimax:tool_call><invoke name="fn"><parameter name="k">v</parameter></invoke></minimax:tool_call>
+        if "<minimax:tool_call>" in model_output:
+            blocks = self.MINIMAX_BLOCK_PATTERN.findall(model_output)
+            for block in blocks:
+                invocations = self.MINIMAX_INVOKE_PATTERN.findall(block)
+                for fn_name, invoke_body in invocations:
+                    params = self.MINIMAX_PARAM_PATTERN.findall(invoke_body)
+                    arguments = {}
+                    for param_name, param_value in params:
+                        # Try to parse as JSON value (number, bool, etc.)
+                        try:
+                            arguments[param_name] = json.loads(param_value.strip())
+                        except (json.JSONDecodeError, ValueError):
+                            arguments[param_name] = param_value.strip()
+                    tool_calls.append(
+                        {
+                            "id": generate_tool_id(),
+                            "name": fn_name.strip(),
+                            "arguments": json.dumps(arguments, ensure_ascii=False),
+                        }
+                    )
+            if tool_calls:
+                cleaned_text = self.MINIMAX_BLOCK_PATTERN.sub("", cleaned_text).strip()
+                return ExtractedToolCallInformation(
+                    tools_called=True,
+                    tool_calls=tool_calls,
+                    content=cleaned_text if cleaned_text else None,
+                )
+
+        # 3. Try Mistral format
         if self.MISTRAL_TOKEN in model_output:
             parts = model_output.split(self.MISTRAL_TOKEN)
             content = parts[0].strip()
