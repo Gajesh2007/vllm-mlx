@@ -30,6 +30,7 @@ Usage:
 The server provides:
     - POST /v1/completions - Text completions
     - POST /v1/chat/completions - Chat completions (with multimodal support)
+    - POST /v1/responses - OpenAI Responses API (translation layer over chat completions)
     - GET /v1/models - List available models
     - GET /health - Health check
     - GET /v1/mcp/tools - List MCP tools
@@ -87,6 +88,7 @@ from .api.models import (
     ModelInfo,  # noqa: F401
     ModelsResponse,
     ToolCall,
+    ToolDefinition,
     Usage,  # noqa: F401
     VideoUrl,  # noqa: F401
 )
@@ -1525,6 +1527,565 @@ def _inject_json_instruction(messages: list, instruction: str) -> list:
         messages.insert(0, {"role": "system", "content": instruction})
 
     return messages
+
+
+# =============================================================================
+# OpenAI Responses API Endpoint (POST /v1/responses)
+# =============================================================================
+
+
+def _responses_convert_input_to_messages(
+    input_data: str | list,
+    instructions: str | None = None,
+) -> list[dict]:
+    """Convert Responses API input format to Chat Completions messages.
+
+    Handles:
+    - Plain string input -> single user message
+    - Array of input items with various types (message, function_call, function_call_output)
+    - Instructions -> system message prepended
+    """
+    messages = []
+
+    # Prepend instructions as system message
+    if instructions:
+        messages.append({"role": "system", "content": instructions})
+
+    # Plain string input
+    if isinstance(input_data, str):
+        messages.append({"role": "user", "content": input_data})
+        return messages
+
+    # Array of input items
+    # We need to group consecutive content items for the same role into one message,
+    # and handle function_call / function_call_output specially.
+    pending_tool_calls = []  # Accumulate tool calls for a single assistant message
+
+    for item in input_data:
+        if isinstance(item, str):
+            messages.append({"role": "user", "content": item})
+            continue
+
+        item_type = item.get("type") if isinstance(item, dict) else None
+        item_role = item.get("role") if isinstance(item, dict) else None
+
+        if item_type == "function_call":
+            # Accumulate tool calls — they'll be flushed as an assistant message
+            pending_tool_calls.append({
+                "id": item.get("call_id", f"call_{uuid.uuid4().hex[:8]}"),
+                "type": "function",
+                "function": {
+                    "name": item.get("name", ""),
+                    "arguments": item.get("arguments", "{}"),
+                },
+            })
+            continue
+
+        if item_type == "function_call_output":
+            # Flush any pending tool calls as an assistant message first
+            if pending_tool_calls:
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": pending_tool_calls,
+                })
+                pending_tool_calls = []
+            # Tool response message
+            messages.append({
+                "role": "tool",
+                "tool_call_id": item.get("call_id", ""),
+                "content": item.get("output", ""),
+            })
+            continue
+
+        # Flush pending tool calls before processing a normal message
+        if pending_tool_calls:
+            messages.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": pending_tool_calls,
+            })
+            pending_tool_calls = []
+
+        # Regular message item (has role + content)
+        if item_role:
+            role = item_role
+            # Map "developer" to "system"
+            if role == "developer":
+                role = "system"
+
+            content = item.get("content", "")
+
+            # Content can be a string or array of content parts
+            if isinstance(content, list):
+                # Extract text from content parts
+                text_parts = []
+                for part in content:
+                    if isinstance(part, dict):
+                        part_type = part.get("type", "")
+                        if part_type == "input_text":
+                            text_parts.append(part.get("text", ""))
+                        elif part_type == "output_text":
+                            text_parts.append(part.get("text", ""))
+                        elif part_type == "text":
+                            text_parts.append(part.get("text", ""))
+                content = "\n".join(text_parts) if text_parts else ""
+
+            messages.append({"role": role, "content": content})
+
+    # Flush any remaining pending tool calls
+    if pending_tool_calls:
+        messages.append({
+            "role": "assistant",
+            "content": None,
+            "tool_calls": pending_tool_calls,
+        })
+
+    return messages
+
+
+def _responses_convert_tools(tools: list[dict] | None) -> list[dict] | None:
+    """Convert flat Responses API tool format to nested Chat Completions format.
+
+    Responses API: {"type": "function", "name": "X", "parameters": {...}, "description": "..."}
+    Chat Completions: {"type": "function", "function": {"name": "X", "parameters": {...}, "description": "..."}}
+    """
+    if not tools:
+        return None
+
+    converted = []
+    for tool in tools:
+        if tool.get("type") == "function" and "name" in tool:
+            # Flat format -> nested format
+            func_def = {"name": tool["name"]}
+            if "parameters" in tool:
+                func_def["parameters"] = tool["parameters"]
+            if "description" in tool:
+                func_def["description"] = tool["description"]
+            if "strict" in tool:
+                func_def["strict"] = tool["strict"]
+            converted.append({"type": "function", "function": func_def})
+        elif "function" in tool:
+            # Already in nested format
+            converted.append(tool)
+        else:
+            converted.append(tool)
+
+    return converted if converted else None
+
+
+def _responses_build_output(
+    text_content: str | None,
+    tool_calls: list | None,
+) -> list[dict]:
+    """Build the Responses API output array from completion results."""
+    output = []
+
+    # Text message output
+    if text_content:
+        output.append({
+            "type": "message",
+            "id": f"msg_{uuid.uuid4().hex[:12]}",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text_content, "annotations": []}],
+            "status": "completed",
+        })
+
+    # Tool call outputs
+    if tool_calls:
+        for tc in tool_calls:
+            output.append({
+                "type": "function_call",
+                "id": f"fc_{uuid.uuid4().hex[:12]}",
+                "call_id": tc.id if hasattr(tc, "id") else tc.get("id", f"call_{uuid.uuid4().hex[:8]}"),
+                "name": tc.function.name if hasattr(tc, "function") else tc.get("function", {}).get("name", ""),
+                "arguments": tc.function.arguments if hasattr(tc, "function") else tc.get("function", {}).get("arguments", "{}"),
+                "status": "completed",
+            })
+
+    return output
+
+
+def _responses_build_usage(prompt_tokens: int, completion_tokens: int) -> dict:
+    """Build Responses API usage object."""
+    return {
+        "input_tokens": prompt_tokens,
+        "output_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "input_tokens_details": {"cached_tokens": 0},
+        "output_tokens_details": {"reasoning_tokens": 0},
+    }
+
+
+@app.post(
+    "/v1/responses",
+    dependencies=[Depends(verify_api_key), Depends(check_rate_limit)],
+)
+async def create_response(raw_request: Request):
+    """
+    OpenAI Responses API endpoint.
+
+    Translates Responses API format requests to Chat Completions format,
+    runs inference through the existing engine, and converts back.
+
+    Supports both streaming and non-streaming modes.
+    """
+    engine = get_engine()
+
+    body = await raw_request.json()
+
+    model = body.get("model", _model_name)
+    _validate_model_name(model)
+
+    input_data = body.get("input", "")
+    instructions = body.get("instructions")
+    stream = body.get("stream", False)
+    temperature = body.get("temperature")
+    top_p = body.get("top_p")
+    max_output_tokens = body.get("max_output_tokens")
+    tools_raw = body.get("tools")
+    tool_choice = body.get("tool_choice")
+
+    # Convert input to messages
+    messages_raw = _responses_convert_input_to_messages(input_data, instructions)
+
+    # Convert to Message objects for extract_multimodal_content
+    chat_messages = []
+    for m in messages_raw:
+        try:
+            chat_messages.append(Message(**m))
+        except Exception:
+            chat_messages.append(Message(role=m.get("role", "user"), content=m.get("content")))
+
+    # Extract content (same as chat completions)
+    if engine.is_mllm:
+        messages = []
+        for msg in chat_messages:
+            if hasattr(msg, "model_dump"):
+                msg_dict = msg.model_dump(exclude_none=True)
+            else:
+                raw = dict(msg)
+                msg_dict = {k: v for k, v in raw.items() if v is not None}
+            messages.append(msg_dict)
+    else:
+        messages, images, videos = extract_multimodal_content(
+            chat_messages,
+            preserve_native_format=engine.preserve_native_tool_format,
+        )
+
+    # Convert tools from flat to nested format
+    converted_tools = _responses_convert_tools(tools_raw)
+
+    # Build chat kwargs
+    chat_kwargs = {
+        "max_tokens": max_output_tokens or _default_max_tokens,
+        "temperature": _resolve_temperature(temperature),
+        "top_p": _resolve_top_p(top_p),
+    }
+
+    if converted_tools:
+        chat_kwargs["tools"] = convert_tools_for_template(
+            [ToolDefinition(**t) for t in converted_tools]
+        )
+
+    # --- Logging ---
+    n_msgs = len(messages)
+    logger.info(
+        f"[REQUEST] POST /v1/responses stream={stream} "
+        f"model={model!r} max_output_tokens={max_output_tokens} "
+        f"temp={temperature} msgs={n_msgs} tools={len(tools_raw) if tools_raw else 0}"
+    )
+
+    response_id = f"resp_{uuid.uuid4().hex[:12]}"
+    created_at = int(time.time())
+
+    if stream:
+        return StreamingResponse(
+            _disconnect_guard(
+                _stream_responses_api(
+                    engine, messages, response_id, created_at, model, chat_kwargs
+                ),
+                raw_request,
+            ),
+            media_type="text/event-stream",
+        )
+
+    # --- Non-streaming path ---
+    start_time = time.perf_counter()
+    timeout = _default_timeout
+
+    output = await _wait_with_disconnect(
+        engine.chat(messages=messages, **chat_kwargs),
+        raw_request,
+        timeout=timeout,
+    )
+    if output is None:
+        return Response(status_code=499)
+
+    elapsed = time.perf_counter() - start_time
+    tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
+    logger.info(
+        f"Responses API: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
+    )
+
+    # Parse tool calls
+    cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text)
+
+    # Clean output text
+    final_content = None
+    if cleaned_text:
+        final_content = clean_output_text(cleaned_text)
+
+    finish_reason = "tool_calls" if tool_calls else output.finish_reason
+
+    # Build Responses API output
+    resp_output = _responses_build_output(final_content, tool_calls)
+    usage = _responses_build_usage(output.prompt_tokens, output.completion_tokens)
+
+    status = "completed"
+    if finish_reason == "length":
+        status = "incomplete"
+
+    response_body = {
+        "id": response_id,
+        "object": "response",
+        "created_at": created_at,
+        "model": _model_name,
+        "output": resp_output,
+        "usage": usage,
+        "status": status,
+        "incomplete_details": {"reason": "max_output_tokens"} if status == "incomplete" else None,
+    }
+
+    return Response(
+        content=json.dumps(response_body),
+        media_type="application/json",
+    )
+
+
+async def _stream_responses_api(
+    engine: BaseEngine,
+    messages: list,
+    response_id: str,
+    created_at: int,
+    model: str,
+    chat_kwargs: dict,
+) -> AsyncIterator[str]:
+    """Stream Responses API SSE events.
+
+    Consumes the engine's stream_chat output and emits events in the
+    Responses API streaming format:
+      response.created -> response.output_item.added ->
+      response.content_part.added -> response.output_text.delta* ->
+      response.content_part.done -> response.output_item.done ->
+      response.completed
+    """
+    start_time = time.perf_counter()
+
+    # Emit response.created
+    created_event = {
+        "type": "response.created",
+        "response": {
+            "id": response_id,
+            "object": "response",
+            "created_at": created_at,
+            "model": _model_name,
+            "output": [],
+            "status": "in_progress",
+        },
+    }
+    yield f"data: {json.dumps(created_event)}\n\n"
+
+    # Track state
+    accumulated_text = ""
+    prompt_tokens = 0
+    completion_tokens = 0
+    msg_id = f"msg_{uuid.uuid4().hex[:12]}"
+    output_item_added = False
+
+    async for output in engine.stream_chat(messages=messages, **chat_kwargs):
+        delta_text = output.new_text
+
+        # Track token counts
+        if hasattr(output, "prompt_tokens") and output.prompt_tokens:
+            prompt_tokens = output.prompt_tokens
+        if hasattr(output, "completion_tokens") and output.completion_tokens:
+            completion_tokens = output.completion_tokens
+
+        if delta_text:
+            # Filter special tokens
+            content = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
+            if not content:
+                accumulated_text += delta_text
+                continue
+
+            accumulated_text += delta_text
+
+            # On first real content, emit output_item.added and content_part.added
+            if not output_item_added:
+                output_item_added = True
+
+                item_added_event = {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "type": "message",
+                        "id": msg_id,
+                        "role": "assistant",
+                        "content": [],
+                        "status": "in_progress",
+                    },
+                }
+                yield f"data: {json.dumps(item_added_event)}\n\n"
+
+                content_part_added = {
+                    "type": "response.content_part.added",
+                    "item_id": msg_id,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": "", "annotations": []},
+                }
+                yield f"data: {json.dumps(content_part_added)}\n\n"
+
+            # Emit text delta
+            delta_event = {
+                "type": "response.output_text.delta",
+                "item_id": msg_id,
+                "output_index": 0,
+                "content_index": 0,
+                "delta": content,
+            }
+            yield f"data: {json.dumps(delta_event)}\n\n"
+
+    # Parse tool calls from accumulated text
+    cleaned_text, tool_calls = _parse_tool_calls_with_parser(accumulated_text)
+
+    final_text = clean_output_text(cleaned_text) if cleaned_text else None
+
+    # Finalize text message output item
+    if output_item_added:
+        # response.output_text.done
+        text_done_event = {
+            "type": "response.output_text.done",
+            "item_id": msg_id,
+            "output_index": 0,
+            "content_index": 0,
+            "text": final_text or "",
+        }
+        yield f"data: {json.dumps(text_done_event)}\n\n"
+
+        # response.content_part.done
+        content_part_done = {
+            "type": "response.content_part.done",
+            "item_id": msg_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": final_text or "", "annotations": []},
+        }
+        yield f"data: {json.dumps(content_part_done)}\n\n"
+
+        # response.output_item.done for message
+        msg_done_event = {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "message",
+                "id": msg_id,
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": final_text or "", "annotations": []}],
+                "status": "completed",
+            },
+        }
+        yield f"data: {json.dumps(msg_done_event)}\n\n"
+
+    # Emit tool call output items
+    if tool_calls:
+        # output_index starts after the message (if any)
+        base_index = 1 if output_item_added else 0
+        for i, tc in enumerate(tool_calls):
+            tc_index = base_index + i
+            fc_id = f"fc_{uuid.uuid4().hex[:12]}"
+            call_id = tc.id if hasattr(tc, "id") else tc.get("id", f"call_{uuid.uuid4().hex[:8]}")
+            fn_name = tc.function.name if hasattr(tc, "function") else tc.get("function", {}).get("name", "")
+            fn_args = tc.function.arguments if hasattr(tc, "function") else tc.get("function", {}).get("arguments", "{}")
+
+            # response.output_item.added for function_call
+            fc_added = {
+                "type": "response.output_item.added",
+                "output_index": tc_index,
+                "item": {
+                    "type": "function_call",
+                    "id": fc_id,
+                    "call_id": call_id,
+                    "name": fn_name,
+                    "arguments": "",
+                    "status": "in_progress",
+                },
+            }
+            yield f"data: {json.dumps(fc_added)}\n\n"
+
+            # response.function_call_arguments.delta — send full arguments as single delta
+            args_delta = {
+                "type": "response.function_call_arguments.delta",
+                "item_id": fc_id,
+                "output_index": tc_index,
+                "delta": fn_args,
+            }
+            yield f"data: {json.dumps(args_delta)}\n\n"
+
+            # response.function_call_arguments.done
+            args_done = {
+                "type": "response.function_call_arguments.done",
+                "item_id": fc_id,
+                "output_index": tc_index,
+                "arguments": fn_args,
+            }
+            yield f"data: {json.dumps(args_done)}\n\n"
+
+            # response.output_item.done for function_call
+            fc_done = {
+                "type": "response.output_item.done",
+                "output_index": tc_index,
+                "item": {
+                    "type": "function_call",
+                    "id": fc_id,
+                    "call_id": call_id,
+                    "name": fn_name,
+                    "arguments": fn_args,
+                    "status": "completed",
+                },
+            }
+            yield f"data: {json.dumps(fc_done)}\n\n"
+
+    # Build final output array for the completed response
+    final_output = _responses_build_output(final_text, tool_calls)
+    usage = _responses_build_usage(prompt_tokens, completion_tokens)
+
+    status = "completed"
+
+    # response.completed
+    completed_event = {
+        "type": "response.completed",
+        "response": {
+            "id": response_id,
+            "object": "response",
+            "created_at": created_at,
+            "model": _model_name,
+            "output": final_output,
+            "usage": usage,
+            "status": status,
+            "incomplete_details": None,
+        },
+    }
+    yield f"data: {json.dumps(completed_event)}\n\n"
+
+    # Log throughput
+    elapsed = time.perf_counter() - start_time
+    tokens_per_sec = completion_tokens / elapsed if elapsed > 0 else 0
+    logger.info(
+        f"Responses API (stream): prompt={prompt_tokens} + completion={completion_tokens} "
+        f"tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
+    )
 
 
 # =============================================================================
