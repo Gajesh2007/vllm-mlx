@@ -101,6 +101,15 @@ class Gemma4ReasoningParser(ReasoningParser):
         if has_start and has_end:
             return DeltaMessage(content=delta_text)
 
+        # Check for partial start token — suppress tokens that are building
+        # toward the start marker (e.g. "<|channel>" then "thought" then "\n").
+        # The server accumulates current_text, so if current_text ends with
+        # a prefix of START_TOKEN, we're mid-marker and should suppress.
+        if not had_start and not has_start and current_text:
+            for prefix_len in range(len(START_TOKEN) - 1, 0, -1):
+                if current_text.endswith(START_TOKEN[:prefix_len]):
+                    return None  # buffer — this might be the start of the marker
+
         # No markers at all — pure content
         return DeltaMessage(content=delta_text)
 
