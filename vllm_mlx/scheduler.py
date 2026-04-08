@@ -18,7 +18,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import mlx.core as mx
-from mlx_lm.generate import BatchGenerator
+from mlx_lm.generate import BatchGenerator, GenerationBatch, PromptProcessingBatch
 from mlx_lm.sample_utils import make_sampler
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
@@ -133,404 +133,105 @@ def _install_chunked_prefill(
     requests: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    Monkey-patch a BatchGenerator instance so that large prefills are
-    broken into chunks of at most *budget* tokens each.
+    Monkey-patch a BatchGenerator to add mid-prefill cache saves and
+    prompt-cache saves on top of the native chunked prefill.
 
-    Between chunks the generation loop gets a chance to produce one token
-    for every active request, preventing starvation during long prefills.
+    mlx-lm 0.31.2's BatchGenerator already chunks prefills via
+    prefill_step_size, interleaving generation between chunks.
+    This patch adds:
+    - prompt_cache_save: saves KV cache when prompt processing completes
+    - mid_prefill_save: saves intermediate KV cache during chunked prefill
+    - Abort detection during prefill via pending_abort_ids
 
     Args:
         batch_gen: The BatchGenerator to patch.
-        budget: Max tokens per prefill chunk.
+        budget: Max tokens per prefill chunk (applied via prefill_step_size).
         mid_prefill_save: Optional callback(uid, processed, prompt_cache)
             called after each chunk to save intermediate KV cache state.
+        prompt_cache_save: Optional callback(uid, extracted_cache)
+            called when prompt processing completes for a sequence.
     """
-    import time as _time
+    # Apply budget as the prefill_step_size for native chunking
+    batch_gen.prefill_step_size = min(budget, batch_gen.prefill_step_size)
 
-    from mlx_lm.generate import (
-        Batch,
-        _left_pad_prompts,
-        _make_cache,
-        _merge_caches,
-        _right_pad_prompts,
-    )
-
-    # Keep references to originals
     _orig_next = batch_gen._next
-    _orig_remove = batch_gen.remove
-    _orig_process_prompts = batch_gen._process_prompts
 
-    # Partial prefill state (None when no prefill in progress)
-    batch_gen._partial = None
-
-    # Monkey-patch _process_prompts to capture prompt-only cache state.
-    # At the point where _process_prompts returns, the Batch cache contains
-    # the exact prompt-only state: all prompt tokens have been processed
-    # through the model, but no output token has been fed back yet.
-    # This is the only safe capture point for hybrid Mamba+Transformer
-    # models whose MambaCache state is cumulative.
-    if prompt_cache_save is not None:
-
-        def _patched_process_prompts(prompts, _self=batch_gen):
-            batch = _orig_process_prompts(prompts)
-            for e, uid in enumerate(batch.uids):
-                if batch.num_tokens[e] == 0:
-                    try:
-                        prompt_cache_save(uid, batch.extract_cache(e))
-                    except Exception:
-                        pass
-            return batch
-
-        batch_gen._process_prompts = _patched_process_prompts
-
-    def _generation_step(self=batch_gen):
-        """Run one generation step on the active batch. Returns responses."""
-        batch = self.active_batch
-        if batch is None or len(batch) == 0:
-            return []
-
-        tic_gen = _time.perf_counter()
-        y, logprobs = batch.y, batch.logprobs
-        for i, toks in enumerate(batch.tokens):
-            batch.tokens[i] = mx.concatenate((toks, y[i : i + 1]))
-        batch.y, batch.logprobs = self._step(
-            y[:, None],
-            batch.cache,
-            batch.samplers,
-            batch.logits_processors,
-            batch.tokens,
-        )
-        mx.async_eval(batch.y, batch.logprobs)
-
-        y = y.tolist()
-        self._stats.generation_time += _time.perf_counter() - tic_gen
-
-        keep_idx = []
-        end_idx = []
-        responses = []
-        for e, (t, uid, num_tok, max_tok) in enumerate(
-            zip(y, batch.uids, batch.num_tokens, batch.max_tokens)
-        ):
-            cache_out = None
-            num_tok += 1
-            batch.num_tokens[e] = num_tok
-            if t in self.stop_tokens:
-                finish_reason = "stop"
-                end_idx.append(e)
-            elif num_tok >= max_tok:
-                finish_reason = "length"
-                end_idx.append(e)
-            else:
-                finish_reason = None
-                keep_idx.append(e)
-            if finish_reason is not None:
-                cache_out = batch.extract_cache(e)
-            responses.append(
-                self.Response(uid, t, logprobs[e], finish_reason, cache_out)
-            )
-
-        if len(end_idx):
-            if len(keep_idx) > 0:
-                batch.filter(keep_idx)
-            else:
-                self.active_batch = None
-
-        self._stats.generation_tokens += len(responses)
-        return responses
-
-    def _chunked_next(self=batch_gen):  # noqa: C901
-        """
-        Replacement for _next() that chunks large prefills.
-
-        Only intercepts when:
-        1. A partial prefill is in progress (_partial is not None)
-        2. The next prompt batch exceeds the budget
-
-        Everything else delegates to the original _next().
-        """
-        # ----- Continue a partial prefill -----
-        if self._partial is not None:
-            # Check for pending aborts BEFORE processing next chunk
-            if pending_abort_ids is not None and uid_to_request_id is not None:
-                partial_rids = {uid_to_request_id.get(u) for u in self._partial["uids"]}
-                aborted_rids = partial_rids & pending_abort_ids
-                if aborted_rids:
+    def _patched_next(self=batch_gen):
+        """Wrapper around _next that adds cache saves and abort checks."""
+        # Check for pending aborts before processing
+        if pending_abort_ids is not None and uid_to_request_id is not None:
+            # Check if any currently-processing prompts have been aborted
+            aborted_uids = []
+            for seq in self._currently_processing:
+                # _currently_processing entries don't directly have UIDs,
+                # but we can check _prompt_batch.uids
+                pass
+            if self._prompt_batch and self._prompt_batch.uids:
+                for uid in list(self._prompt_batch.uids):
+                    rid = uid_to_request_id.get(uid)
+                    if rid and rid in pending_abort_ids:
+                        aborted_uids.append(uid)
+                if aborted_uids:
                     logger.info(
-                        f"[chunked_prefill] abort detected mid-prefill, "
-                        f"clearing partial for: {aborted_rids}"
+                        f"[chunked_prefill] abort detected mid-prefill for uids: "
+                        f"{aborted_uids}"
                     )
-                    self._partial = None
-                    mx.clear_cache()
-                    return self._generation_step()
-
-            tic = _time.perf_counter()
-            partial = self._partial
-            inputs = partial["inputs"]
-            prompt_cache = partial["cache"]
-            remaining = inputs.shape[1]
-
-            n_to_process = min(budget, remaining - 1) if remaining > 1 else 0
-
-            if n_to_process > 0:
-                self.model(mx.contiguous(inputs[:, :n_to_process]), cache=prompt_cache)
-                mx.eval([c.state for c in prompt_cache])
-                inputs = inputs[:, n_to_process:]
-                partial["inputs"] = inputs
-                partial["processed"] += n_to_process
-
-                self.prompt_progress_callback(
-                    [
-                        (uid, partial["processed"], partial["total"])
-                        for uid in partial["uids"]
-                    ]
-                )
-
-                # Save intermediate cache for disconnect resilience
-                if mid_prefill_save is not None and len(partial["uids"]) == 1:
-                    mid_prefill_save(
-                        partial["uids"][0], partial["processed"], prompt_cache
-                    )
-
-                if partial.get("is_cached"):
+                    self.remove(aborted_uids)
                     mx.clear_cache()
 
-            # Check if prefill is done (only 1 token left or 0)
-            if inputs.shape[1] <= 1:
-                # Finalize
-                if partial.get("is_cached"):
-                    mx.eval([c.state for c in prompt_cache])
-                    inputs = partial["last_inputs"]
+        prompt_responses, generation_responses = _orig_next()
 
-                for c in prompt_cache:
-                    c.finalize()
-                mx.clear_cache()
-
-                y, logprobs = self._step(
-                    inputs,
-                    prompt_cache,
-                    partial["samplers"],
-                    partial["logits_processors"],
-                    partial["tokens"],
-                )
-                mx.async_eval(y, logprobs)
-
-                new_batch = Batch(
-                    list(partial["uids"]),
-                    y,
-                    logprobs,
-                    list(partial["max_tokens"]),
-                    [0] * len(partial["uids"]),
-                    prompt_cache,
-                    list(partial["samplers"]),
-                    list(partial["logits_processors"]),
-                    partial["tokens"],
-                )
-
-                # Save prompt-only cache BEFORE merging into active batch.
-                # This is the chunked-prefill equivalent of the
-                # _patched_process_prompts hook — at this point the cache
-                # contains the exact prompt-only state (num_tokens == 0).
-                if prompt_cache_save is not None and len(partial["uids"]) == 1:
-                    uid = partial["uids"][0]
+        # Save prompt-only cache when sequences transition to generation
+        if prompt_cache_save is not None:
+            for pr in prompt_responses:
+                if pr.end_of_prompt:
                     try:
-                        prompt_cache_save(uid, new_batch.extract_cache(0))
+                        # The sequence just moved to generation — extract
+                        # its cache from the generation batch
+                        for e, uid in enumerate(self._generation_batch.uids):
+                            if uid == pr.uid:
+                                prompt_cache_save(
+                                    uid,
+                                    self._generation_batch.extract_cache(e),
+                                )
+                                break
                     except Exception:
                         pass
 
-                if self.active_batch is None:
-                    self.active_batch = new_batch
-                else:
-                    self.active_batch.extend(new_batch)
+        # Save intermediate cache during chunked prefill
+        if mid_prefill_save is not None:
+            for pr in prompt_responses:
+                if not pr.end_of_prompt and pr.progress:
+                    processed, total = pr.progress
+                    if processed > 0:
+                        # Find this uid in the prompt batch and extract cache
+                        for e, uid in enumerate(self._prompt_batch.uids):
+                            if uid == pr.uid:
+                                try:
+                                    mid_prefill_save(
+                                        uid,
+                                        processed,
+                                        self._prompt_batch.prompt_cache,
+                                    )
+                                except Exception:
+                                    pass
+                                break
 
-                self._partial = None
-                self._stats.prompt_time += _time.perf_counter() - tic
-            else:
-                # Not done yet — record prompt time for this chunk
-                self._stats.prompt_time += _time.perf_counter() - tic
-
-            # Generation step for active requests between chunks
-            return self._generation_step()
-
-        # ----- No partial — check if next prompt batch needs chunking -----
-        num_active = len(self.active_batch) if self.active_batch else 0
-        num_to_add = self.completion_batch_size - num_active
-
-        if num_to_add >= self.prefill_batch_size and self.unprocessed_prompts:
-            batch_prompts = self.unprocessed_prompts[: self.prefill_batch_size]
-            if batch_prompts:
-                total_tokens = sum(len(p[1]) for p in batch_prompts)
-
-                # Check if any prompt has a prefix_boundary that
-                # requires two-phase prefill for cache save at that boundary.
-                _needs_boundary_split = False
-                if requests is not None and uid_to_request_id is not None:
-                    for _uid, _toks, *_ in batch_prompts:
-                        _rid = uid_to_request_id.get(_uid)
-                        _req = requests.get(_rid) if _rid else None
-                        if _req and getattr(_req, "prefix_boundary", 0) > 0:
-                            _needs_boundary_split = True
-                            break
-
-                if total_tokens > budget or _needs_boundary_split:
-                    # Large prompt batch or prefix boundary — start partial prefill
-                    tic = _time.perf_counter()
-
-                    # Eval outstanding generation tokens before switching.
-                    # Also drain pending async_eval when active_batch is None
-                    # (previous request finished) — stale async_eval work on
-                    # generation_stream can block subsequent model forwards.
-                    if self.active_batch is not None:
-                        mx.eval(self.active_batch.y, self.active_batch.logprobs)
-                        self._stats.generation_time += _time.perf_counter() - tic
-                        tic = _time.perf_counter()
-                    else:
-                        mx.clear_cache()
-
-                    (
-                        uids,
-                        inputs_raw,
-                        max_tokens_list,
-                        caches,
-                        samplers,
-                        logits_processors,
-                        _prompt_checkpoints,
-                    ) = zip(*batch_prompts)
-                    lengths = [len(p) for p in inputs_raw]
-                    max_length = max(lengths)
-                    padding = [max_length - ln for ln in lengths]
-                    tokens = [mx.array(inp) for inp in inputs_raw]
-                    is_cached = not all(c[0].empty() for c in caches)
-
-                    self._stats.prompt_tokens += sum(lengths)
-
-                    if not is_cached:
-                        padded = _left_pad_prompts(inputs_raw, max_length=max_length)
-                        prompt_cache = _make_cache(
-                            self.model, padding, self.max_kv_size
-                        )
-                    else:
-                        last_inputs = mx.array([p[-1:] for p in inputs_raw])
-                        padded = _right_pad_prompts(inputs_raw, max_length=max_length)
-                        prompt_cache = _merge_caches(caches)
-                        for c in prompt_cache:
-                            c.prepare(
-                                lengths=[ln - 1 for ln in lengths],
-                                right_padding=padding,
-                            )
-
-                    # Remove from unprocessed
-                    self.unprocessed_prompts = self.unprocessed_prompts[
-                        self.prefill_batch_size :
-                    ]
-
-                    # Process first chunk — if prefix_boundary is set,
-                    # use it as the first chunk size so that mid_prefill_save
-                    # can capture the exact prefix cache state (critical for
-                    # hybrid Mamba+Transformer models where trim is unsafe).
-                    # When the request already has cached tokens (cache hit),
-                    # adjust the boundary relative to the remaining tokens.
-                    _first_chunk = budget
-                    if _needs_boundary_split and len(batch_prompts) == 1:
-                        _uid0 = uids[0]
-                        _rid0 = uid_to_request_id.get(_uid0)
-                        _req0 = requests.get(_rid0) if _rid0 else None
-                        _pb = getattr(_req0, "prefix_boundary", 0) if _req0 else 0
-                        _cached = getattr(_req0, "cached_tokens", 0) if _req0 else 0
-                        _adjusted_pb = _pb - _cached
-                        if 0 < _adjusted_pb < padded.shape[1]:
-                            _first_chunk = _adjusted_pb
-                    n_to_process = min(_first_chunk, padded.shape[1] - 1)
-                    if n_to_process > 0:
-                        self.model(
-                            mx.contiguous(padded[:, :n_to_process]),
-                            cache=prompt_cache,
-                        )
-                        mx.eval([c.state for c in prompt_cache])
-                        padded = padded[:, n_to_process:]
-                        if is_cached:
-                            mx.clear_cache()
-
-                    self._partial = {
-                        "uids": list(uids),
-                        "inputs": padded,
-                        "cache": prompt_cache,
-                        "tokens": tokens,
-                        "max_tokens": list(max_tokens_list),
-                        "samplers": list(samplers),
-                        "logits_processors": list(logits_processors),
-                        "processed": n_to_process,
-                        "total": max_length,
-                        "is_cached": is_cached,
-                    }
-                    if is_cached:
-                        self._partial["last_inputs"] = last_inputs
-
-                    self.prompt_progress_callback(
-                        [
-                            (uid, n_to_process, max_length)
-                            for uid in self._partial["uids"]
-                        ]
-                    )
-
-                    # Save intermediate cache for disconnect resilience
-                    if mid_prefill_save is not None and len(uids) == 1:
-                        mid_prefill_save(uids[0], n_to_process, prompt_cache)
-
-                    self._stats.prompt_time += _time.perf_counter() - tic
-
-                    # Generation step for active requests
-                    return self._generation_step()
-
-                else:
-                    # Small prompt batch — process directly without _orig_next.
-                    # _orig_next's while loop processes multiple batches per call
-                    # which causes batch-dimension mismatches in DeltaRNN conv_state
-                    # when mixing prefix-cached and fresh prompts.
-                    # Processing one batch per _next call avoids this.
-                    tic = _time.perf_counter()
-
-                    # Eval outstanding generation tokens before prefill.
-                    # Also drain when active_batch is None to clear stale
-                    # async_eval work from the previous request.
-                    if self.active_batch is not None:
-                        mx.eval(self.active_batch.y, self.active_batch.logprobs)
-                        self._stats.generation_time += _time.perf_counter() - tic
-                        tic = _time.perf_counter()
-                    else:
-                        mx.clear_cache()
-
-                    new_batch = self._process_prompts(batch_prompts)
-                    self.unprocessed_prompts = self.unprocessed_prompts[
-                        self.prefill_batch_size :
-                    ]
-
-                    if self.active_batch is None:
-                        self.active_batch = new_batch
-                    else:
-                        self.active_batch.extend(new_batch)
-
-                    self._stats.prompt_time += _time.perf_counter() - tic
-                    return self._generation_step()
-
-        # Pure generation or no work — run generation step directly
-        return self._generation_step()
-
-    def _patched_remove(uids_to_remove, _self=batch_gen):
-        """Clear partial state if aborted request is being prefilled."""
-        if _self._partial is not None:
-            partial_uids = set(_self._partial["uids"])
-            if partial_uids & set(uids_to_remove):
+        # Log prefill progress
+        for pr in prompt_responses:
+            if pr.progress:
+                processed, total = pr.progress
+                rid = uid_to_request_id.get(pr.uid, "?") if uid_to_request_id else "?"
+                if isinstance(rid, str) and len(rid) > 12:
+                    rid = rid[:12]
                 logger.info(
-                    f"[chunked_prefill] clearing partial state for aborted uids: "
-                    f"{partial_uids & set(uids_to_remove)}"
+                    f"[prefill] request={rid} "
+                    f"tokens={processed}/{total}"
                 )
-                _self._partial = None
-                mx.clear_cache()  # flush Metal encoders after dropping partial state
-        _orig_remove(uids_to_remove)
 
-    batch_gen._next = _chunked_next
-    batch_gen._generation_step = _generation_step
-    batch_gen.remove = _patched_remove
+        return prompt_responses, generation_responses
+
+    batch_gen._next = _patched_next
 
     logger.info(f"[chunked_prefill] installed with budget={budget} tokens per step")
 
@@ -542,414 +243,19 @@ def _install_mtp(
     optimistic: bool = False,
 ) -> None:
     """
-    Monkey-patch a BatchGenerator to use MTP (Multi-Token Prediction)
-    with always-advance strategy for hybrid MambaCache + KVCache.
+    Multi-Token Prediction monkey-patch for BatchGenerator.
 
-    Flow per generation step:
-    1. Use skip_state logits/hidden OR run model forward -> sample primary
-    2. MTP head drafts one token after primary
-    3. Verify [primary, draft] in one model call (always advances cache)
-    4. Accept: skip_state from pos 1, defer draft for next step emission
-       Reject: trim KVCache by 1, skip_state from pos 0 (no cold start)
-    5. Draft is emitted in the NEXT generation step after primary
+    TODO: MTP needs migration to mlx-lm 0.31.2 API. The old implementation
+    relied on BatchGenerator._step(), active_batch, batch.y/logprobs,
+    self.Response, and self.stop_tokens — all of which were removed or
+    renamed in 0.31.2. The new GenerationBatch handles generation
+    internally via GenerationBatch._step() and GenerationBatch.next().
+    MTP would need to hook into GenerationBatch._step() instead.
     """
-    _orig_step = batch_gen._step
-
-    # Greedy sampler for MTP draft tokens
-    _draft_sampler = make_sampler(temp=0.0)
-
-    # Skip state: when MTP accepts, the cache already consumed [primary, draft].
-    # Next _step call receives primary as input but must NOT re-feed it.
-    # Instead, use stored logits from the verify pass.
-    # Format: {'logits': (B, V), 'hidden': (B, 1, H)}
-    _skip_state = [None]
-
-    # Deferred drafts: draft tokens to emit in the NEXT generation step,
-    # keyed by UID for stability across batch changes.
-    # Format: {uid: {'token': int, 'logprobs': mx.array}}
-    _deferred_drafts = {}
-
-    # MTP stats
-    _mtp_stats = {"accepted": 0, "rejected": 0, "errors": 0}
-
-    def _mtp_step(
-        input_tokens,
-        prompt_cache,
-        samplers,
-        logits_processors,
-        tokens,
-    ):
-        """
-        Extended _step with MTP always-advance strategy.
-
-        Every step (after skip):
-        1. Use skip_state logits/hidden OR run model forward
-        2. Sample primary token P
-        3. MTP head drafts token D
-        4. Verify [P, D] in one model call (always advances cache)
-        5. Accept: skip_state from position 1 (after D), defer D
-           Reject: trim KVCache by 1, skip_state from position 0 (after P)
-
-        No snapshot/restore — eliminates cold starts after rejection.
-        MambaCache layers accept minor pollution on reject (exponential decay).
-
-        During prefill (multi-token input), MTP is skipped entirely.
-        """
-        batch_size = input_tokens.shape[0]
-
-        # --- Prefill guard: skip MTP for multi-token input,
-        # during _process_prompts (active_batch not yet set), or when
-        # the cache doesn't belong to the active batch (e.g. during
-        # _process_prompts in the 2nd+ iteration of _orig_next's loop
-        # or during _chunked_next partial prefill finalization).
-        if (
-            input_tokens.shape[1] > 1
-            or batch_gen.active_batch is None
-            or prompt_cache is not batch_gen.active_batch.cache
-        ):
-            _skip_state[0] = None
-            return _orig_step(
-                input_tokens,
-                prompt_cache,
-                samplers,
-                logits_processors,
-                tokens,
-            )
-
-        # --- Check skip state from previous MTP step ---
-        skip = _skip_state[0]
-        if skip is not None:
-            if skip["logits"].shape[0] != batch_size:
-                # Batch size changed since skip was stored — invalidate
-                skip = None
-                _skip_state[0] = None
-
-        if skip is not None:
-            # Skip mode: model already processed input_tokens during
-            # previous verify. Use stored logits + hidden instead.
-            logits = skip["logits"]
-            hidden_states = skip["hidden"]
-            _skip_state[0] = None
-        else:
-            # Normal model forward
-            model_output = model(input_tokens, cache=prompt_cache, return_hidden=True)
-            if isinstance(model_output, tuple):
-                logits, hidden_states = model_output
-            else:
-                # Model doesn't support return_hidden — fall back
-                return _orig_step(
-                    input_tokens,
-                    prompt_cache,
-                    samplers,
-                    logits_processors,
-                    tokens,
-                )
-            logits = logits[:, -1, :]
-
-        # --- Apply logits processors + sample primary ---
-        if any(logits_processors):
-            processed_logits = []
-            for e in range(batch_size):
-                sample_logits = logits[e : e + 1]
-                for processor in logits_processors[e]:
-                    sample_logits = processor(tokens[e], sample_logits)
-                processed_logits.append(sample_logits)
-            logits = mx.concatenate(processed_logits, axis=0)
-
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        if any(samplers):
-            all_samples = []
-            for e in range(batch_size):
-                sample_sampler = samplers[e] or batch_gen.sampler
-                sampled = sample_sampler(logprobs[e : e + 1])
-                all_samples.append(sampled)
-            primary_tokens = mx.concatenate(all_samples, axis=0)
-        else:
-            primary_tokens = batch_gen.sampler(logprobs)
-
-        # Get current UIDs (guaranteed non-empty: prefill guard above
-        # prevents MTP from running when active_batch is None).
-        current_uids = list(batch_gen.active_batch.uids)
-
-        # --- MTP draft + always-advance verify ---
-        try:
-            # Draft: predict token n+2 from hidden states + primary (n+1)
-            draft_logits = model.mtp_forward(
-                hidden_states[:, -1:, :],
-                primary_tokens[:, None],
-                mtp_cache=None,
-            )
-            draft_logits = draft_logits[:, -1, :]
-            draft_logprobs = draft_logits - mx.logsumexp(
-                draft_logits, axis=-1, keepdims=True
-            )
-            draft_tokens = _draft_sampler(draft_logprobs)
-
-            # Always-advance: feed [primary, draft] and let cache advance.
-            #
-            # Hybrid models (e.g. Qwen3-Next) mix attention (KVCache) and
-            # recurrent layers (MambaCache/DeltaRNN).  KVCache supports
-            # trim(1) to undo the draft token on reject, but recurrent
-            # state is irreversible — rejected drafts permanently pollute
-            # the RNN state, causing progressive output corruption.
-            #
-            # For hybrid models we snapshot recurrent state before verify
-            # and on reject: trim KV by 2 (remove both P and D), restore
-            # RNN snapshot, then re-advance with just P so both cache
-            # types end up consistent at [..., P].
-            _rnn_snapshots = {}
-            for _ci, _c in enumerate(prompt_cache):
-                if not (hasattr(_c, "is_trimmable") and _c.is_trimmable()):
-                    if hasattr(_c, "state"):
-                        _rnn_snapshots[_ci] = [
-                            s.copy() if s is not None else None for s in _c.state
-                        ]
-
-            verify_input = mx.concatenate(
-                [primary_tokens[:, None], draft_tokens[:, None]], axis=1
-            )
-            verify_output = model(verify_input, cache=prompt_cache, return_hidden=True)
-            if isinstance(verify_output, tuple):
-                verify_logits, verify_hidden = verify_output
-            else:
-                verify_logits = verify_output
-                verify_hidden = None
-
-            if optimistic:
-                # --- OPTIMISTIC: always accept, zero sync ---
-                if verify_hidden is not None:
-                    _skip_state[0] = {
-                        "logits": verify_logits[:, 1, :],
-                        "hidden": verify_hidden[:, -1:, :],
-                    }
-                    verify_lp = verify_logits[:, 0, :] - mx.logsumexp(
-                        verify_logits[:, 0, :], axis=-1, keepdims=True
-                    )
-                    mx.async_eval(
-                        _skip_state[0]["logits"],
-                        _skip_state[0]["hidden"],
-                        draft_tokens,
-                        verify_lp,
-                    )
-                    for e in range(batch_size):
-                        uid = current_uids[e]
-                        _deferred_drafts[uid] = {
-                            "token_array": draft_tokens[e : e + 1],
-                            "logprobs": verify_lp[e],
-                        }
-                else:
-                    _skip_state[0] = None
-                _mtp_stats["accepted"] += 1
-            else:
-                # --- VERIFIED MODE: single eval + Python comparison ---
-                verify_pred = mx.argmax(verify_logits[:, 0, :], axis=-1)
-                mx.eval(verify_pred, draft_tokens)
-                pred_list = verify_pred.tolist()
-                draft_list = draft_tokens.tolist()
-                all_accepted = pred_list == draft_list
-
-                if all_accepted and verify_hidden is not None:
-                    # --- ACCEPT ---
-                    _skip_state[0] = {
-                        "logits": verify_logits[:, 1, :],
-                        "hidden": verify_hidden[:, -1:, :],
-                    }
-                    mx.async_eval(_skip_state[0]["logits"], _skip_state[0]["hidden"])
-                    verify_lp = verify_logits[:, 0, :] - mx.logsumexp(
-                        verify_logits[:, 0, :], axis=-1, keepdims=True
-                    )
-                    for e in range(batch_size):
-                        uid = current_uids[e]
-                        _deferred_drafts[uid] = {
-                            "token": draft_list[e],
-                            "logprobs": verify_lp[e],
-                        }
-                    _mtp_stats["accepted"] += 1
-
-                else:
-                    # --- REJECT (always-advance) ---
-                    if _rnn_snapshots:
-                        # Hybrid model: undo the entire verify pass
-                        # (both P and D) for all cache types, then
-                        # re-advance with just P for a consistent state.
-                        for c in prompt_cache:
-                            if (
-                                hasattr(c, "is_trimmable")
-                                and c.is_trimmable()
-                                and hasattr(c, "trim")
-                            ):
-                                c.trim(2)
-                        for _ci, _snap in _rnn_snapshots.items():
-                            prompt_cache[_ci].state = _snap
-                        # Re-advance with primary only — both KV and RNN
-                        # now advance by exactly 1 (the primary token).
-                        rerun_out = model(
-                            primary_tokens[:, None],
-                            cache=prompt_cache,
-                            return_hidden=True,
-                        )
-                        if isinstance(rerun_out, tuple):
-                            rerun_logits, rerun_hidden = rerun_out
-                        else:
-                            rerun_logits = rerun_out
-                            rerun_hidden = None
-                        if rerun_hidden is not None:
-                            _skip_state[0] = {
-                                "logits": rerun_logits[:, -1, :],
-                                "hidden": rerun_hidden[:, -1:, :],
-                            }
-                            mx.async_eval(
-                                _skip_state[0]["logits"],
-                                _skip_state[0]["hidden"],
-                            )
-                        else:
-                            _skip_state[0] = None
-                    else:
-                        # Pure attention model: simple trim(1) is enough.
-                        for c in prompt_cache:
-                            if (
-                                hasattr(c, "is_trimmable")
-                                and c.is_trimmable()
-                                and hasattr(c, "trim")
-                            ):
-                                c.trim(1)
-                        if verify_hidden is not None:
-                            _skip_state[0] = {
-                                "logits": verify_logits[:, 0, :],
-                                "hidden": verify_hidden[:, 0:1, :],
-                            }
-                            mx.async_eval(
-                                _skip_state[0]["logits"],
-                                _skip_state[0]["hidden"],
-                            )
-                        else:
-                            _skip_state[0] = None
-                    for uid in current_uids:
-                        _deferred_drafts.pop(uid, None)
-                    _mtp_stats["rejected"] += 1
-
-        except Exception as e:
-            logger.debug(f"[MTP] draft/verify failed: {e}")
-            _skip_state[0] = None
-            _mtp_stats["errors"] += 1
-
-        return primary_tokens, list(logprobs)
-
-    # Wrap _next() to emit deferred MTP drafts after each primary token.
-    # This works regardless of whether _chunked_next or original _next is
-    # the current _next implementation, because it sits at the top level.
-    # Store as attribute so it's always the correct reference, even after
-    # BatchGenerator recreation.
-    batch_gen._inner_next = batch_gen._next
-
-    def _mtp_next(self=batch_gen):
-        """Wrapper around _next that emits deferred MTP draft tokens.
-
-        After each primary token, if the previous step's MTP draft was
-        accepted, it is emitted as an additional response.
-        """
-        # Clear stale MTP state when no batch is active.
-        # This prevents skip_state/deferred_drafts from a finished request
-        # from leaking into the next request and causing stale computation
-        # graph references on generation_stream.
-        if self.active_batch is None:
-            _skip_state[0] = None
-            _deferred_drafts.clear()
-
-        # Save deferred drafts from PREVIOUS step before _inner_next
-        # runs _mtp_step, which may store NEW deferred drafts.
-        prev_deferred = {}
-        if self.active_batch is not None:
-            for uid in self.active_batch.uids:
-                if uid in _deferred_drafts:
-                    prev_deferred[uid] = _deferred_drafts.pop(uid)
-
-        # Run the inner _next (original or chunked) — calls _mtp_step
-        responses = self._inner_next()
-
-        if not prev_deferred or not responses:
-            return responses
-
-        # Augment responses with deferred drafts from the previous step.
-        # The Response from _next reports the OLD batch.y (the primary
-        # from the *previous* _step call). The deferred draft follows
-        # that primary in the token stream, so emit it AFTER the primary.
-        augmented = []
-        draft_end_uids = set()
-        for r in responses:
-            uid = r.uid
-
-            # Emit the primary response first
-            augmented.append(r)
-
-            if r.finish_reason is not None:
-                # Sequence ended with primary — discard any pending draft
-                _deferred_drafts.pop(uid, None)
-                prev_deferred.pop(uid, None)
-                continue
-
-            # Emit deferred draft AFTER its primary
-            if uid in prev_deferred:
-                draft_info = prev_deferred.pop(uid)
-                if "token" in draft_info:
-                    draft_t = draft_info["token"]
-                else:
-                    draft_t = draft_info["token_array"].item()
-                draft_lp = draft_info["logprobs"]
-
-                if draft_t in self.stop_tokens:
-                    augmented.append(
-                        self.Response(uid, draft_t, draft_lp, "stop", None)
-                    )
-                    draft_end_uids.add(uid)
-                else:
-                    draft_finish = None
-                    batch = self.active_batch
-                    if batch is not None:
-                        for e, bu in enumerate(batch.uids):
-                            if bu == uid:
-                                batch.num_tokens[e] += 1
-                                batch.tokens[e] = mx.concatenate(
-                                    (batch.tokens[e], mx.array([draft_t]))
-                                )
-                                if batch.num_tokens[e] >= batch.max_tokens[e]:
-                                    draft_finish = "length"
-                                    draft_end_uids.add(uid)
-                                break
-
-                    draft_cache_out = None
-                    if draft_finish is not None and batch is not None:
-                        for e, bu in enumerate(batch.uids):
-                            if bu == uid:
-                                draft_cache_out = batch.extract_cache(e)
-                                break
-
-                    augmented.append(
-                        self.Response(
-                            uid, draft_t, draft_lp, draft_finish, draft_cache_out
-                        )
-                    )
-
-        # Remove sequences that finished due to draft tokens
-        if draft_end_uids and self.active_batch is not None:
-            keep = [
-                e
-                for e, u in enumerate(self.active_batch.uids)
-                if u not in draft_end_uids
-            ]
-            if keep:
-                self.active_batch.filter(keep)
-            else:
-                self.active_batch = None
-
-        return augmented
-
-    batch_gen._step = _mtp_step
-    batch_gen._next = _mtp_next
-
-    mode_str = "optimistic (no verify)" if optimistic else "always-advance"
-    logger.info(
-        f"[MTP] installed with num_draft_tokens={num_draft_tokens}, " f"{mode_str} mode"
+    logger.warning(
+        "[MTP] MTP is not yet supported with mlx-lm 0.31.2. "
+        "The --enable-mtp flag will be ignored. "
+        "Generation will proceed without multi-token prediction."
     )
 
 
@@ -1141,24 +447,19 @@ class Scheduler:
         if sampling_params.stop_token_ids:
             stop_tokens.update(sampling_params.stop_token_ids)
 
-        def _prefill_progress(progress_list):
-            """Log prefill progress for each uid chunk."""
-            for uid, processed, total in progress_list:
-                rid = self.uid_to_request_id.get(uid, "?")
-                logger.info(
-                    f"[prefill] request={rid[:12] if isinstance(rid, str) else rid} "
-                    f"tokens={processed}/{total}"
-                )
+        # mlx-lm 0.31.2: stop_tokens is Sequence[Sequence[int]] — each
+        # stop token is a sequence (for multi-token stop sequences).
+        # Wrap each single-token ID in a list.
+        stop_token_seqs = [[t] for t in stop_tokens]
 
         bg = BatchGenerator(
             model=self.model,
             max_tokens=sampling_params.max_tokens,
-            stop_tokens=stop_tokens,
+            stop_tokens=stop_token_seqs,
             sampler=sampler,
             prefill_batch_size=self.config.prefill_batch_size,
             completion_batch_size=self.config.completion_batch_size,
             prefill_step_size=self.config.prefill_step_size,
-            prompt_progress_callback=_prefill_progress,
         )
 
         # Install chunked prefill when explicitly configured OR when
@@ -1679,7 +980,7 @@ class Scheduler:
 
         Handles the case where the request was already removed from
         self.requests by _cleanup_request() but still lives in the
-        BatchGenerator (e.g. in _partial or active_batch).
+        BatchGenerator (e.g. in _generation_batch or _prompt_batch).
 
         Args:
             request_id: The request ID to abort
@@ -1702,7 +1003,7 @@ class Scheduler:
 
         # Remove from running (BatchGenerator) — do this even if request
         # was already cleaned up from self.requests, because the UID may
-        # still be live inside the BatchGenerator (_partial / active_batch).
+        # still be live inside the BatchGenerator (_generation_batch / _prompt_batch).
         if request_id in self.request_id_to_uid:
             was_running = True
             uid = self.request_id_to_uid[request_id]
@@ -2138,7 +1439,7 @@ class Scheduler:
         Returns:
             Set of aborted request IDs.
         """
-        # Close batch generator (clears _partial state, active_batch)
+        # Close batch generator (clears _generation_batch, _prompt_batch)
         self._close_batch_generator()
         self._current_sampler_params = None
 
@@ -2216,11 +1517,14 @@ class Scheduler:
 
                 # Run generation step if we have running requests
                 if self.batch_generator is not None and self.running:
-                    responses = self.batch_generator.next()
+                    # mlx-lm 0.31.2: next() returns (prompt_responses, generation_responses)
+                    _prompt_responses, generation_responses = self.batch_generator.next()
                     output.has_work = True
 
-                    if responses:
-                        outputs, finished_ids = self._process_batch_responses(responses)
+                    if generation_responses:
+                        outputs, finished_ids = self._process_batch_responses(
+                            generation_responses
+                        )
                         output.outputs = outputs
                         output.finished_request_ids = finished_ids
                         self._cleanup_finished(finished_ids)
@@ -2285,10 +1589,10 @@ class Scheduler:
             # Evaluate batch tokens to collapse lazy concatenation chains
             if (
                 self.batch_generator is not None
-                and self.batch_generator.active_batch is not None
-                and hasattr(self.batch_generator.active_batch, "tokens")
+                and len(self.batch_generator._generation_batch) > 0
+                and hasattr(self.batch_generator._generation_batch, "tokens")
             ):
-                tokens = self.batch_generator.active_batch.tokens
+                tokens = self.batch_generator._generation_batch.tokens
                 if tokens:
                     mx.eval(*tokens)
             mx.clear_cache()
