@@ -432,7 +432,12 @@ def serve_command(args):
                 # Call generate with the SAME prompt string we sent to rank 1.
                 # Do NOT call _original_chat — it re-templates and may produce
                 # different tokens, causing all_sum deadlock.
-                return _original_generate(prompt_str, **kwargs)
+                # Filter kwargs to only those generate() accepts.
+                gen_kwargs = {
+                    k: v for k, v in kwargs.items()
+                    if k in ("max_tokens", "temperature", "top_p", "repetition_penalty", "stop")
+                }
+                return _original_generate(prompt_str, **gen_kwargs)
 
             llm.generate = _tp_generate
             llm.chat = _tp_chat
