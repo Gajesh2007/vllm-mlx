@@ -88,19 +88,15 @@ def _init_jaccl(tp_config: TPConfig) -> mx.distributed.Group:
     os.environ["MLX_IBV_DEVICES"] = dev_file.name
     os.environ["MLX_RANK"] = str(tp_config.rank)
 
-    # JACCL coordinator: rank 0 LISTENS, rank 1 CONNECTS.
-    # peer_address is always the OTHER machine's IP.
-    # For rank 0: coordinator = own IP (bind/listen) — use 0.0.0.0 to bind all interfaces
-    # For rank 1: coordinator = rank 0's IP (connect) — that's our peer_address
-    if tp_config.rank == 0:
-        # Rank 0 listens — bind to all interfaces on the coordinator port
-        port = tp_config.peer_address.split(":")[-1] if ":" in tp_config.peer_address else "19990"
-        coordinator = f"0.0.0.0:{port}"
-    else:
-        # Rank 1 connects to rank 0's address
-        coordinator = tp_config.peer_address
-
-    os.environ["MLX_JACCL_COORDINATOR"] = coordinator
+    # JACCL coordinator: a TCP endpoint used for initial QP setup only.
+    # Does NOT need to be on the TB5 interface — can use Tailscale, LAN, etc.
+    # BOTH ranks must use the SAME address (rank 0's reachable IP:port).
+    # Rank 0 binds to it, rank 1 connects to it.
+    #
+    # peer_address format: "<rank0_ip>:<port>"
+    # For rank 0: peer_address is rank 1's IP — we need to derive our own bind addr
+    # For rank 1: peer_address is rank 0's IP — use directly as coordinator
+    os.environ["MLX_JACCL_COORDINATOR"] = tp_config.peer_address
 
     logger.info(
         f"Initializing JACCL backend: rank={tp_config.rank}, "
