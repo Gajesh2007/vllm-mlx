@@ -265,6 +265,8 @@ def serve_command(args):
         # TP loading path
         from pathlib import Path
 
+        import gc
+        import mlx.core as mx
         from .tp import get_strategy
         from .tp.distributed import init_distributed
         from .tp.encryption import EncryptedAllSum
