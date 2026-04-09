@@ -269,6 +269,13 @@ def serve_command(args):
         from .tp.loader import sharded_load
         from .tp.worker import TPBatchWorker
 
+        # Wrap entire TP setup in try/except for graceful exit.
+        # GPU memory leaks if we crash during Metal compute — os._exit(0)
+        # is the only safe cleanup on Apple Silicon.
+        import signal
+        signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+        signal.signal(signal.SIGINT, lambda *_: os._exit(0))
+
         # 1. Download model first (BEFORE distributed init — HF deadlock)
         from mlx_lm.utils import _download
 
