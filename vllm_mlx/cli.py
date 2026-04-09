@@ -315,9 +315,12 @@ def serve_command(args):
         strategy.apply_patches(model, group, tp_config.ratio)
         strategy.update_head_counts(model, tp_config.rank, tp_config.ratio)
 
-        # 5b. Load tokenizer (needed for engine + encryption warmup)
-        from mlx_lm import load as _load_tokenizer
-        _, tokenizer = _load_tokenizer(args.model)
+        # 5b. Load tokenizer ONLY (not the full model — that would reload 33GB)
+        from mlx_lm.utils import load_tokenizer as _load_tok
+        tokenizer_config = {}
+        if "qwen3" in args.model.lower():
+            tokenizer_config["eos_token"] = "<|im_end|>"
+        tokenizer = _load_tok(model_path, tokenizer_config_extra=tokenizer_config)
 
         # 6. Encrypted all_sum (if enabled)
         if tp_config.encrypt:
