@@ -70,89 +70,84 @@ def sharded_load(
         f"sharded, {sum(1 for s in shard_map.values() if s.strategy == 'replicate')} replicated"
     )
 
-    # 3. Load model with mlx_lm (handles quantization, config, everything).
-    # lazy=True means weights are memory-mapped, not materialized to GPU yet.
+    # 3. Load model with mlx_lm to get proper quantized structure.
+    # lazy=True: weights are mmap'd, not in GPU memory yet.
     from mlx_lm.utils import load_model as _load_model
 
     model, loaded_config = _load_model(model_path, lazy=True, strict=False)
     logger.info(f"Model loaded lazily: {type(model).__name__}")
 
-    # 4. Shard weights in-place, one layer at a time.
-    # For each parameter, slice it according to the sharding map, eval the
-    # slice (materializes only the sharded portion to GPU), then assign back.
-    # Peak memory ≈ one full layer + accumulated sharded layers.
-    from mlx.utils import tree_flatten, tree_unflatten
+    # 4. Replace weights with sharded versions loaded from safetensors.
+    #
+    # CRITICAL MEMORY CONSTRAINT:
+    # mx.eval(lazy_tensor[0:N]) materializes the FULL lazy tensor first,
+    # then slices. On 36GB with a 33.8GB model, this OOMs.
+    #
+    # Solution: load each safetensors file with mx.load() (returns NEW lazy
+    # tensors not linked to the model's lazy graph), shard each one, eval
+    # the sharded slice, and assign to the model. The model's original lazy
+    # weights are overwritten and never evaluated.
+    from mlx.utils import tree_flatten
 
-    total_loaded = 0
-    total_keys = 0
-    n_column = 0
-    n_row = 0
-    n_replicate = 0
-    n_unmatched = 0
-    sharded_pairs: list[tuple[str, mx.array]] = []
+    weight_files = sorted(model_path.glob("model*.safetensors"))
+    if not weight_files:
+        weight_files = sorted(model_path.glob("*.safetensors"))
 
-    all_params = list(tree_flatten(model.parameters()))
-    logger.info(f"Total model parameters: {len(all_params)}")
+    n_column = n_row = n_replicate = n_unmatched = total_loaded = total_keys = 0
 
-    for name, param in all_params:
-        spec = shard_map.get(name)
-        if spec is None:
-            n_unmatched += 1
-            arr = param
-        elif spec.strategy == "replicate":
-            n_replicate += 1
-            arr = param
-        elif spec.strategy == "column":
-            n_column += 1
-            axis = spec.axis
-            dim = param.shape[axis]
-            split_point = int(dim * spec.ratio)
-            if tp_config.rank == 0:
-                arr = _mx_slice_axis(param, axis, 0, split_point)
+    for wf in weight_files:
+        raw = mx.load(str(wf))  # Fresh lazy tensors from safetensors mmap
+        file_pairs: list[tuple[str, mx.array]] = []
+
+        for key, tensor in raw.items():
+            spec = shard_map.get(key)
+
+            if spec is None:
+                n_unmatched += 1
+                arr = tensor
+            elif spec.strategy == "replicate":
+                n_replicate += 1
+                arr = tensor
+            elif spec.strategy == "column":
+                n_column += 1
+                dim = tensor.shape[spec.axis]
+                sp = int(dim * spec.ratio)
+                if tp_config.rank == 0:
+                    arr = mx.contiguous(_mx_slice_axis(tensor, spec.axis, 0, sp))
+                else:
+                    arr = mx.contiguous(_mx_slice_axis(tensor, spec.axis, sp, dim))
+            elif spec.strategy == "row":
+                n_row += 1
+                axis = spec.axis
+                if axis < 0:
+                    axis = len(tensor.shape) + axis
+                dim = tensor.shape[axis]
+                sp = int(dim * spec.ratio)
+                if tp_config.rank == 0:
+                    arr = mx.contiguous(_mx_slice_axis(tensor, axis, 0, sp))
+                else:
+                    arr = mx.contiguous(_mx_slice_axis(tensor, axis, sp, dim))
+                if (key.endswith(".bias") or key.endswith(".biases")) and tp_config.rank != 0:
+                    arr = mx.zeros_like(arr)
             else:
-                arr = _mx_slice_axis(param, axis, split_point, dim)
-            arr = mx.contiguous(arr)
-        elif spec.strategy == "row":
-            n_row += 1
-            axis = spec.axis
-            if axis < 0:
-                axis = len(param.shape) + axis
-            dim = param.shape[axis]
-            split_point = int(dim * spec.ratio)
-            if tp_config.rank == 0:
-                arr = _mx_slice_axis(param, axis, 0, split_point)
-            else:
-                arr = _mx_slice_axis(param, axis, split_point, dim)
-            arr = mx.contiguous(arr)
-            # Bias: only rank 0 keeps it for row-parallel (all_sum would double)
-            is_bias = name.endswith(".bias") or name.endswith(".biases")
-            if is_bias and tp_config.rank != 0:
-                arr = mx.zeros_like(arr)
-        else:
-            arr = param
+                arr = tensor
 
-        sharded_pairs.append((name, arr))
-        total_keys += 1
+            mx.eval(arr)
+            file_pairs.append((key, arr))
+            total_loaded += arr.nbytes
+            total_keys += 1
+            del tensor
 
-    # Apply sharded weights to model. Do NOT mx.eval() individual weights
-    # before this — that would materialize full lazy tensors alongside
-    # sharded ones, doubling peak memory and OOM'ing on 36GB machines.
-    model.load_weights(sharded_pairs, strict=False)
+        # Assign this file's weights and free
+        model.load_weights(file_pairs, strict=False)
+        del file_pairs, raw
+        gc.collect()
 
-    # Now eval all parameters at once — the lazy graph resolves only
-    # the sharded slices, not the original full tensors.
-    mx.eval(model.parameters())
-    total_loaded = sum(p.nbytes for _, p in tree_flatten(model.parameters()))
-
-    del sharded_pairs
-    gc.collect()
     logger.info(
         f"Sharded {total_keys} params: "
         f"{n_column} column, {n_row} row, {n_replicate} replicate, "
-        f"{n_unmatched} unmatched (replicated), {total_loaded / 1e9:.1f} GB"
+        f"{n_unmatched} unmatched, {total_loaded / 1e9:.1f} GB"
     )
-
-    # Log a sample weight to verify sharding
     for n, p in tree_flatten(model.parameters()):
         if "layers.0.self_attn.q_proj.weight" in n:
             logger.info(f"  Sample: {n} shape={p.shape}")
