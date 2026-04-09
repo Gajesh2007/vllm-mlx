@@ -131,13 +131,19 @@ def sharded_load(
         else:
             arr = param
 
-        mx.eval(arr)
         sharded_pairs.append((name, arr))
-        total_loaded += arr.nbytes
         total_keys += 1
 
-    # Apply sharded weights back to model
+    # Apply sharded weights to model. Do NOT mx.eval() individual weights
+    # before this — that would materialize full lazy tensors alongside
+    # sharded ones, doubling peak memory and OOM'ing on 36GB machines.
     model.load_weights(sharded_pairs, strict=False)
+
+    # Now eval all parameters at once — the lazy graph resolves only
+    # the sharded slices, not the original full tensors.
+    mx.eval(model.parameters())
+    total_loaded = sum(p.nbytes for _, p in tree_flatten(model.parameters()))
+
     del sharded_pairs
     gc.collect()
     logger.info(
@@ -147,8 +153,7 @@ def sharded_load(
     )
 
     # Log a sample weight to verify sharding
-    from mlx.utils import tree_flatten as _tf
-    for n, p in _tf(model.parameters()):
+    for n, p in tree_flatten(model.parameters()):
         if "layers.0.self_attn.q_proj.weight" in n:
             logger.info(f"  Sample: {n} shape={p.shape}")
             break
