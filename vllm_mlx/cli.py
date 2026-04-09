@@ -271,11 +271,18 @@ def serve_command(args):
         from .tp.loader import sharded_load
         from .tp.worker import TPBatchWorker
 
-        # Wrap entire TP setup in try/except for graceful exit.
-        # GPU memory leaks if we crash during Metal compute — os._exit(0)
-        # is the only safe cleanup on Apple Silicon.
+        # Graceful exit handlers
         signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
         signal.signal(signal.SIGINT, lambda *_: os._exit(0))
+
+        # Start TCP sync channel early (rank 0 only).
+        # Rank 1 connects during its startup — if we start this after model
+        # loading, rank 1 times out waiting (model load takes ~60s).
+        _sync_server = None
+        if tp_config.is_server:
+            from .tp.sync_channel import SyncServer
+            sync_port = int(tp_config.peer_address.split(":")[-1]) + 100
+            _sync_server = SyncServer(sync_port)
 
         # 1. Download model first (BEFORE distributed init — HF deadlock)
         from mlx_lm.utils import _download
@@ -358,11 +365,9 @@ def serve_command(args):
             from .engine.simple import SimpleEngine
             from .engine.adaptive import AdaptiveEngine
             from .models.llm import MLXLanguageModel
-            from .tp.sync_channel import SyncServer, GenerateRequest
+            from .tp.sync_channel import GenerateRequest
 
-            # Start TCP sync channel for rank 1
-            sync_port = int(tp_config.peer_address.split(":")[-1]) + 100
-            sync_server = SyncServer(sync_port)
+            sync_server = _sync_server  # Started early, before model loading
 
             server._tp_config = tp_config
             server._tp_group = group
