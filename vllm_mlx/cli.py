@@ -408,7 +408,11 @@ def serve_command(args):
                 return _original_generate(prompt, **kwargs)
 
             def _tp_chat(messages, **kwargs):
-                # Apply chat template to get prompt string, send to rank 1
+                # Apply chat template to get prompt string.
+                # CRITICAL: both ranks MUST call generate() with the EXACT same
+                # string. If rank 0 calls chat() (which re-templates internally)
+                # and rank 1 calls generate(prompt_str), the token sequences may
+                # differ in length, causing all_sum deadlock.
                 if hasattr(tokenizer, "apply_chat_template"):
                     try:
                         prompt_str = tokenizer.apply_chat_template(
@@ -425,7 +429,10 @@ def serve_command(args):
                     temperature=kwargs.get("temperature", 0.0),
                     top_p=kwargs.get("top_p", 1.0),
                 ))
-                return _original_chat(messages, **kwargs)
+                # Call generate with the SAME prompt string we sent to rank 1.
+                # Do NOT call _original_chat — it re-templates and may produce
+                # different tokens, causing all_sum deadlock.
+                return _original_generate(prompt_str, **kwargs)
 
             llm.generate = _tp_generate
             llm.chat = _tp_chat
