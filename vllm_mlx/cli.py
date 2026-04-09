@@ -429,9 +429,19 @@ def serve_command(args):
             def _tp_chat(messages, **kwargs):
                 if hasattr(tokenizer, "apply_chat_template"):
                     try:
-                        prompt_str = tokenizer.apply_chat_template(
-                            messages, tokenize=False, add_generation_prompt=True
-                        )
+                        # Disable thinking mode for direct answers
+                        template_kwargs = {
+                            "tokenize": False,
+                            "add_generation_prompt": True,
+                        }
+                        try:
+                            prompt_str = tokenizer.apply_chat_template(
+                                messages, enable_thinking=False, **template_kwargs
+                            )
+                        except TypeError:
+                            prompt_str = tokenizer.apply_chat_template(
+                                messages, **template_kwargs
+                            )
                     except Exception:
                         prompt_str = str(messages)
                 else:
