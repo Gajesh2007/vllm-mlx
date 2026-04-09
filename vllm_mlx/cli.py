@@ -315,13 +315,15 @@ def serve_command(args):
                 print(f"  - {err}")
             sys.exit(1)
 
-        # 3. Load model with sharded weights
-        print(f"Loading sharded weights (rank {tp_config.rank}, ratio {tp_config.local_ratio:.3f})...")
-        model, _ = sharded_load(model_path, strategy, tp_config, model_config=model_config)
-
-        # 4. Init distributed
+        # 3. Init distributed FIRST (both ranks must connect before loading
+        # weights, because per-file loading takes different time on each rank
+        # and the slower one would miss JACCL's connection window)
         print("Initializing distributed backend...")
         group = init_distributed(tp_config)
+
+        # 4. Load model with sharded weights (now both ranks are connected)
+        print(f"Loading sharded weights (rank {tp_config.rank}, ratio {tp_config.local_ratio:.3f})...")
+        model, _ = sharded_load(model_path, strategy, tp_config, model_config=model_config)
 
         # 5. Apply TP patches (class-level all_sum wiring)
         print("Applying tensor parallel patches...")
