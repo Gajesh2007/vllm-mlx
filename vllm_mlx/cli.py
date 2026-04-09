@@ -189,7 +189,188 @@ def serve_command(args):
                 f"keep={args.specprefill_keep_pct*100:.0f}%)"
             )
 
-    # Load model with unified server
+    # --- Tensor Parallelism Mode ---
+    if getattr(args, "tensor_parallel", False):
+        from .tp.config import TPConfig, detect_chip_bandwidth
+        from .tp.discovery import (
+            check_rdma_prerequisites,
+            discover_local,
+            discover_peer,
+            negotiate_config,
+        )
+
+        print("\n=== Tensor Parallelism ===")
+
+        # Auto-discovery or manual config
+        if args.tp_auto_discover:
+            print("Auto-discovering TP peer on Thunderbolt 5...")
+            local_info = discover_local()
+            peer_info = discover_peer(local_info, timeout=30)
+            if peer_info is None:
+                print("ERROR: No TP peer found. Ensure both machines are running.")
+                sys.exit(1)
+            tp_config = negotiate_config(
+                local_info,
+                peer_info,
+                ratio=args.tp_ratio,
+                backend=args.tp_backend,
+                encrypt=not args.tp_no_encrypt,
+                worker_port=args.tp_worker_port,
+            )
+        else:
+            if args.tp_rank is None or args.tp_peer is None:
+                print("ERROR: --tensor-parallel requires either --tp-auto-discover or --tp-rank + --tp-peer")
+                sys.exit(1)
+
+            ratio = args.tp_ratio
+            if ratio is None:
+                print(
+                    "WARNING: --tp-ratio not specified and no auto-discover. "
+                    "Use --tp-auto-discover or specify --tp-ratio explicitly.\n"
+                    "Defaulting to 0.5 (equal split). This may not be optimal "
+                    "for heterogeneous hardware."
+                )
+                ratio = 0.5
+
+            tp_config = TPConfig(
+                ratio=ratio,
+                rank=args.tp_rank,
+                peer_address=args.tp_peer,
+                local_rdma=args.tp_local_rdma or "",
+                remote_rdma=args.tp_remote_rdma or "",
+                backend=args.tp_backend,
+                encrypt=not args.tp_no_encrypt,
+                worker_port=args.tp_worker_port,
+            )
+
+        # Check RDMA prerequisites
+        if tp_config.backend == "jaccl":
+            issues = check_rdma_prerequisites()
+            if issues:
+                print("RDMA issues detected:")
+                for issue in issues:
+                    print(f"  - {issue}")
+                print("Fix these before starting, or use --tp-backend ring")
+                sys.exit(1)
+
+        print(f"  Rank: {tp_config.rank} ({'server' if tp_config.is_server else 'worker'})")
+        print(f"  Ratio: {tp_config.ratio:.4f} (rank 0 gets {tp_config.ratio*100:.1f}%)")
+        print(f"  Backend: {tp_config.backend}")
+        print(f"  Encrypt: {tp_config.encrypt}")
+        print(f"  Peer: {tp_config.peer_address}")
+        print("=" * 60)
+
+        # TP loading path
+        from pathlib import Path
+
+        from .tp import get_strategy
+        from .tp.distributed import init_distributed
+        from .tp.encryption import EncryptedAllSum
+        from .tp.loader import sharded_load
+        from .tp.worker import TPBatchWorker
+
+        # 1. Download model first (BEFORE distributed init — HF deadlock)
+        from mlx_lm.utils import _download
+
+        print(f"Ensuring model is downloaded: {args.model}")
+        model_path = Path(_download(args.model))
+        print(f"Model path: {model_path}")
+
+        # 2. Load config to determine strategy
+        import json as _json
+        with open(model_path / "config.json") as f:
+            model_config = _json.load(f)
+        text_config = model_config.get("text_config", model_config)
+        model_type = text_config.get("model_type", model_config.get("model_type", "unknown"))
+        print(f"Model type: {model_type}")
+
+        strategy = get_strategy(model_type)
+
+        # Validate ratio
+        errors = strategy.validate_ratio(text_config, tp_config.ratio)
+        if errors:
+            print("ERROR: Invalid TP ratio for this model:")
+            for err in errors:
+                print(f"  - {err}")
+            sys.exit(1)
+
+        # 3. Load model with sharded weights
+        print(f"Loading sharded weights (rank {tp_config.rank}, ratio {tp_config.local_ratio:.3f})...")
+        model, _ = sharded_load(model_path, strategy, tp_config, model_config=model_config)
+
+        # 4. Init distributed
+        print("Initializing distributed backend...")
+        group = init_distributed(tp_config)
+
+        # 5. Apply TP patches (class-level all_sum wiring)
+        print("Applying tensor parallel patches...")
+        strategy.apply_patches(model, group, tp_config.ratio)
+        strategy.update_head_counts(model, tp_config.rank, tp_config.ratio)
+
+        # 5b. Load tokenizer (needed for engine + encryption warmup)
+        from mlx_lm import load as _load_tokenizer
+        _, tokenizer = _load_tokenizer(args.model)
+
+        # 6. Encrypted all_sum (if enabled)
+        if tp_config.encrypt:
+            peer_ip = tp_config.peer_address.split(":")[0]
+            enc = EncryptedAllSum(group, max_tokens=args.max_tokens)
+            print("Performing DH-2048 key exchange...")
+            enc.key_exchange(peer_ip)
+            print("Running encryption warmup...")
+            enc.warmup(model, tokenizer)
+            enc.install()
+            print("Encrypted all_sum active")
+
+        # 7. Branch: server vs worker
+        if tp_config.is_server:
+            # Rank 0: Wrap model for TP broadcast, inject into engine, start HTTP
+            from .engine.simple import SimpleEngine
+            from .engine.adaptive import AdaptiveEngine
+            from .models.llm import MLXLanguageModel
+            from .tp.model_wrapper import TPModelWrapper
+
+            server._tp_config = tp_config
+            server._tp_group = group
+
+            # Wrap model: every forward pass now broadcasts inputs to rank 1
+            # before executing. Without this, rank 0 hits all_sum in the first
+            # layer and hangs forever (rank 1 is waiting for recv signals).
+            tp_model = TPModelWrapper(model, group)
+
+            # Build engine around the wrapped, sharded model
+            _model_name = args.served_model_name or args.model
+            server._model_name = _model_name
+            server._model_path = args.model
+            server._default_max_tokens = args.max_tokens
+
+            llm = MLXLanguageModel(args.model)
+            llm.model = tp_model
+            llm.tokenizer = tokenizer
+            llm._loaded = True
+
+            simple = SimpleEngine(model_name=args.model)
+            simple._model = llm
+            simple._loaded = True
+
+            engine = AdaptiveEngine(simple)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(engine.start())
+            server._engine = engine
+
+            print(f"\nStarting TP server at http://{args.host}:{args.port}")
+            uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+        else:
+            # Rank 1: Run worker loop (blocks until shutdown)
+            print("\nStarting TP worker (rank 1)...")
+            worker = TPBatchWorker(model, tokenizer, group, tp_config)
+            worker.run()
+            # worker.run() calls os._exit(0) on shutdown
+
+        return  # Don't fall through to normal server start
+
+    # Load model with unified server (standard non-TP path)
     load_model(
         args.model,
         use_batching=args.continuous_batching,
@@ -889,6 +1070,68 @@ Examples:
         default=None,
         help="Pre-load an embedding model at startup (e.g. mlx-community/embeddinggemma-300m-6bit)",
     )
+
+    # --- Tensor Parallelism ---
+    tp_group = serve_parser.add_argument_group("Tensor Parallelism")
+    tp_group.add_argument(
+        "--tensor-parallel",
+        action="store_true",
+        help="Enable multi-node tensor parallelism over Thunderbolt 5",
+    )
+    tp_group.add_argument(
+        "--tp-rank",
+        type=int,
+        default=None,
+        help="This process's rank (0=server, 1=worker). Auto-detected with --tp-auto-discover.",
+    )
+    tp_group.add_argument(
+        "--tp-peer",
+        type=str,
+        default=None,
+        help="Peer's TB5 bridge address (ip:port). Auto-detected with --tp-auto-discover.",
+    )
+    tp_group.add_argument(
+        "--tp-ratio",
+        type=float,
+        default=None,
+        help="Rank 0's weight fraction (e.g. 0.625 for 5/8 split). Default: auto from hardware bandwidth.",
+    )
+    tp_group.add_argument(
+        "--tp-backend",
+        type=str,
+        default="jaccl",
+        choices=["jaccl", "ring"],
+        help="Distributed backend: 'jaccl' (RDMA, default) or 'ring' (TCP fallback)",
+    )
+    tp_group.add_argument(
+        "--tp-local-rdma",
+        type=str,
+        default=None,
+        help="Local RDMA device name (e.g. rdma_en3). Auto-detected with --tp-auto-discover.",
+    )
+    tp_group.add_argument(
+        "--tp-remote-rdma",
+        type=str,
+        default=None,
+        help="Remote RDMA device name (e.g. rdma_en2). Auto-detected with --tp-auto-discover.",
+    )
+    tp_group.add_argument(
+        "--tp-no-encrypt",
+        action="store_true",
+        help="Disable encrypted all_sum (not recommended for untrusted networks)",
+    )
+    tp_group.add_argument(
+        "--tp-auto-discover",
+        action="store_true",
+        help="Auto-discover TP peer on Thunderbolt 5 link",
+    )
+    tp_group.add_argument(
+        "--tp-worker-port",
+        type=int,
+        default=8001,
+        help="Worker health endpoint port (default: 8001)",
+    )
+
     # Bench command
     bench_parser = subparsers.add_parser("bench", help="Run benchmark")
     bench_parser.add_argument("model", type=str, help="Model to benchmark")
