@@ -72,10 +72,10 @@ def sharded_load(
     )
 
     # 3. Build model architecture (weights will be loaded below)
-    from mlx_lm.utils import get_model_classes, load_config
+    from mlx_lm.utils import _get_classes, load_model
 
-    # Determine model class
-    model_class, model_args_class = get_model_classes(config=model_config)
+    # Determine model class from config
+    model_class, model_args_class = _get_classes(config=model_config)
     model_args = model_args_class.from_dict(text_config)
     model = model_class(model_args)
 
