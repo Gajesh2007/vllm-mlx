@@ -52,6 +52,17 @@ def sharded_load(
     """
     t0 = time.perf_counter()
 
+    # 0. Memory safety check — refuse to load if available memory is too low
+    from vllm_mlx.tp.watchdog import MemoryMonitor
+    mem = MemoryMonitor(warn_threshold_gb=4.0, critical_threshold_gb=2.0)
+    avail, total = mem.check()
+    logger.info(f"Memory before loading: {avail:.1f}/{total:.1f} GB available")
+    if avail < 4.0:
+        raise MemoryError(
+            f"Only {avail:.1f} GB available (need ≥4 GB). "
+            f"Previous crash may have leaked GPU memory — reboot the machine."
+        )
+
     # 1. Load config
     if model_config is None:
         config_path = model_path / "config.json"
