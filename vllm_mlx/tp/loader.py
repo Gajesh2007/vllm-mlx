@@ -97,12 +97,14 @@ def sharded_load(
         q_mode = quantization.get("mode", "affine")
 
         def _class_predicate(path: str, m: nn.Module) -> bool | dict:
-            # Check model-level quant_predicate first
+            # Only quantize modules that support it (have to_quantized method)
+            if not hasattr(m, "to_quantized"):
+                return False
+            # Check model-level quant_predicate for per-path overrides
             quant_pred = getattr(model, "quant_predicate", None)
             if quant_pred is not None:
                 return quant_pred(path, m)
-            # Default: only quantize modules that support it
-            return hasattr(m, "to_quantized")
+            return True
 
         nn.quantize(
             model,
