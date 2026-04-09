@@ -1,45 +1,42 @@
-"""Gemma4 tensor parallel sharding strategy.
+"""Gemma4 tensor parallel sharding strategy using MLX's shard_linear API.
 
-Handles the unique aspects of Gemma4's architecture:
-- Hybrid attention: sliding (head_dim=256, 16 KV) + full (head_dim=512, 4 KV, K=V)
-- K=V on full layers: no v_proj weight, k_proj output used as both K and V
-- Global KV replication: 4 full-attention KV heads are replicated (too few to split)
-- Sliding window pattern: configurable repeating pattern of layer types
-- Logit softcapping: tanh(logits/30)*30 applied post-lm_head
+Uses nn.layers.distributed.shard_linear() to create AllToShardedLinear /
+ShardedToAllLinear layers. These handle weight splitting AND all_sum
+internally — no manual weight slicing or class-level __call__ patching.
+
+Pattern per transformer layer:
+  Q/K/V projections → all-to-sharded (each rank gets partial heads)
+  O projection → sharded-to-all (recombines via all_sum)
+  MLP gate/up → all-to-sharded
+  MLP down → sharded-to-all
 """
 
 from __future__ import annotations
 
 import logging
-import re
 from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import shard_linear
 
 from vllm_mlx.tp.strategy import ShardSpec, ShardingStrategy
 
 logger = logging.getLogger("vllm_mlx.tp")
 
-# Track patched classes to avoid double-patching
-_patched_classes: set[type] = set()
-
 
 class Gemma4Strategy(ShardingStrategy):
-    """Tensor parallel sharding for Gemma4 31B (and variants)."""
+    """Tensor parallel sharding for Gemma4 using MLX's official shard_linear API."""
 
     def build_sharding_map(
         self, model_config: dict, ratio: float
     ) -> dict[str, ShardSpec]:
-        """Build weight key → ShardSpec mapping for Gemma4.
+        """Build weight key → ShardSpec mapping.
 
-        Weight keys follow the pattern:
-            model.layers.{i}.self_attn.{q,k,v,o}_proj.{weight,scales,biases}
-            model.layers.{i}.mlp.{gate,up,down}_proj.{weight,scales,biases}
-            model.layers.{i}.{input,post_attention,post_feedforward,pre_feedforward}_layernorm.weight
-            model.layers.{i}.self_attn.{q,k}_norm.weight
-            model.embed_tokens.weight
-            model.norm.weight
+        Note: with the shard_linear approach, the sharding map is only used
+        for the per-file weight loader (to know which axis to slice for
+        memory-efficient loading). The actual distributed behavior is handled
+        by shard_linear replacing the layer types.
         """
         num_layers = model_config.get("num_hidden_layers", 60)
         layer_types = self._compute_layer_types(model_config)
@@ -52,62 +49,54 @@ class Gemma4Strategy(ShardingStrategy):
             is_full = layer_types[i] == "full_attention"
             is_k_eq_v = k_eq_v and is_full
 
-            # Q projection: always column-parallel (split output dim = head dim)
+            # Q: always column-parallel
             for suffix in ("weight", "scales", "biases"):
-                key = f"{prefix}.self_attn.q_proj.{suffix}"
-                shard_map[key] = ShardSpec(strategy="column", axis=0, ratio=ratio)
+                shard_map[f"{prefix}.self_attn.q_proj.{suffix}"] = ShardSpec(
+                    strategy="column", axis=0, ratio=ratio
+                )
 
-            # K projection: column-parallel for sliding, replicate for full (K=V)
+            # K: column-parallel for sliding, replicate for full (K=V, too few heads)
             for suffix in ("weight", "scales", "biases"):
-                key = f"{prefix}.self_attn.k_proj.{suffix}"
                 if is_k_eq_v:
-                    shard_map[key] = ShardSpec(strategy="replicate")
+                    shard_map[f"{prefix}.self_attn.k_proj.{suffix}"] = ShardSpec(strategy="replicate")
                 else:
-                    shard_map[key] = ShardSpec(strategy="column", axis=0, ratio=ratio)
+                    shard_map[f"{prefix}.self_attn.k_proj.{suffix}"] = ShardSpec(
+                        strategy="column", axis=0, ratio=ratio
+                    )
 
-            # V projection: only exists on sliding layers (not K=V)
+            # V: only on sliding layers
             if not is_k_eq_v:
                 for suffix in ("weight", "scales", "biases"):
-                    key = f"{prefix}.self_attn.v_proj.{suffix}"
-                    shard_map[key] = ShardSpec(strategy="column", axis=0, ratio=ratio)
+                    shard_map[f"{prefix}.self_attn.v_proj.{suffix}"] = ShardSpec(
+                        strategy="column", axis=0, ratio=ratio
+                    )
 
-            # O projection: row-parallel (split input dim)
+            # O: row-parallel
             for suffix in ("weight", "scales", "biases"):
-                key = f"{prefix}.self_attn.o_proj.{suffix}"
-                shard_map[key] = ShardSpec(strategy="row", axis=-1, ratio=ratio)
+                shard_map[f"{prefix}.self_attn.o_proj.{suffix}"] = ShardSpec(
+                    strategy="row", axis=-1, ratio=ratio
+                )
 
-            # MLP: gate/up are column-parallel, down is row-parallel
-            for proj_name in ("gate_proj", "up_proj"):
+            # MLP
+            for proj in ("gate_proj", "up_proj"):
                 for suffix in ("weight", "scales", "biases"):
-                    key = f"{prefix}.mlp.{proj_name}.{suffix}"
-                    shard_map[key] = ShardSpec(strategy="column", axis=0, ratio=ratio)
-
+                    shard_map[f"{prefix}.mlp.{proj}.{suffix}"] = ShardSpec(
+                        strategy="column", axis=0, ratio=ratio
+                    )
             for suffix in ("weight", "scales", "biases"):
-                key = f"{prefix}.mlp.down_proj.{suffix}"
-                shard_map[key] = ShardSpec(strategy="row", axis=-1, ratio=ratio)
+                shard_map[f"{prefix}.mlp.down_proj.{suffix}"] = ShardSpec(
+                    strategy="row", axis=-1, ratio=ratio
+                )
 
-            # Norms and scalars: replicate
-            for norm_name in (
-                "input_layernorm",
-                "post_attention_layernorm",
-                "post_feedforward_layernorm",
-                "pre_feedforward_layernorm",
-            ):
-                key = f"{prefix}.{norm_name}.weight"
-                shard_map[key] = ShardSpec(strategy="replicate")
+            # Norms, scalars: replicate
+            for norm in ("input_layernorm", "post_attention_layernorm",
+                         "post_feedforward_layernorm", "pre_feedforward_layernorm"):
+                shard_map[f"{prefix}.{norm}.weight"] = ShardSpec(strategy="replicate")
+            for norm in ("q_norm", "k_norm"):
+                shard_map[f"{prefix}.self_attn.{norm}.weight"] = ShardSpec(strategy="replicate")
+            shard_map[f"{prefix}.layer_scalar"] = ShardSpec(strategy="replicate")
 
-            # Attention norms (q_norm, k_norm if present)
-            for norm_name in ("q_norm", "k_norm"):
-                key = f"{prefix}.self_attn.{norm_name}.weight"
-                shard_map[key] = ShardSpec(strategy="replicate")
-
-            # Per-layer scalar
-            key = f"{prefix}.layer_scalar"
-            shard_map[key] = ShardSpec(strategy="replicate")
-
-        # Embeddings: replicate (shared across ranks, used for both input + lm_head)
         shard_map["language_model.model.embed_tokens.weight"] = ShardSpec(strategy="replicate")
-        # Final norm: replicate
         shard_map["language_model.model.norm.weight"] = ShardSpec(strategy="replicate")
 
         return shard_map
@@ -115,203 +104,116 @@ class Gemma4Strategy(ShardingStrategy):
     def apply_patches(
         self, model: nn.Module, group: mx.distributed.Group, ratio: float
     ) -> set[type]:
-        """Patch Gemma4 attention and MLP classes for all_sum reductions.
+        """Replace linear layers with distributed versions using shard_linear.
 
-        After row-parallel layers (o_proj, down_proj), the partial results from
-        each rank must be summed. We patch __call__ at the class level.
+        This is the MLX-official approach: shard_linear creates
+        AllToShardedLinear / ShardedToAllLinear layers that handle
+        weight splitting AND all_sum internally. No monkey-patching needed.
         """
         inner = self._get_inner_model(model)
-        if not hasattr(inner, "layers") or len(inner.layers) == 0:
-            raise ValueError("Model has no layers — cannot apply TP patches")
+        layer_types = self._compute_layer_types_from_model(inner)
 
-        patched: set[type] = set()
+        k_eq_v = getattr(inner.layers[0].self_attn, "use_k_eq_v", False) if inner.layers else False
 
-        # Patch attention class
-        attn_sample = inner.layers[0].self_attn
-        attn_cls = type(attn_sample)
-        if attn_cls not in _patched_classes:
-            _patch_attention_class(attn_cls, group)
-            _patched_classes.add(attn_cls)
-            patched.add(attn_cls)
+        for i, layer in enumerate(inner.layers):
+            attn = layer.self_attn
+            is_full = layer_types[i] == "full_attention"
+            is_k_eq_v_layer = getattr(attn, "use_k_eq_v", False)
 
-        # Patch MLP class
-        mlp_sample = inner.layers[0].mlp
-        mlp_cls = type(mlp_sample)
-        if mlp_cls not in _patched_classes:
-            _patch_mlp_class(mlp_cls, group)
-            _patched_classes.add(mlp_cls)
-            patched.add(mlp_cls)
+            # Q: all-to-sharded
+            attn.q_proj = shard_linear(attn.q_proj, "all-to-sharded", group=group)
 
-        # Mark all attention layers with the group (used by patched __call__)
-        for layer in inner.layers:
-            layer.self_attn._tp_group = group
-            layer.mlp._tp_group = group
+            # K: all-to-sharded for sliding, leave as-is for full (replicated)
+            if not is_k_eq_v_layer:
+                attn.k_proj = shard_linear(attn.k_proj, "all-to-sharded", group=group)
+                if hasattr(attn, "v_proj"):
+                    attn.v_proj = shard_linear(attn.v_proj, "all-to-sharded", group=group)
 
-        logger.info(
-            f"Patched {len(patched)} classes for all_sum: "
-            f"{[c.__name__ for c in patched]}"
-        )
-        return patched
+            # O: sharded-to-all (handles all_sum internally)
+            attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
+
+            # MLP
+            mlp = layer.mlp
+            mlp.gate_proj = shard_linear(mlp.gate_proj, "all-to-sharded", group=group)
+            mlp.up_proj = shard_linear(mlp.up_proj, "all-to-sharded", group=group)
+            mlp.down_proj = shard_linear(mlp.down_proj, "sharded-to-all", group=group)
+
+            if i == 0:
+                logger.info(
+                    f"Layer 0: q_proj type={type(attn.q_proj).__name__}, "
+                    f"o_proj type={type(attn.o_proj).__name__}"
+                )
+
+        logger.info(f"Sharded {len(inner.layers)} layers with shard_linear")
+        return set()  # No class-level patches needed
 
     def update_head_counts(
         self, model: nn.Module, rank: int, ratio: float
     ) -> None:
-        """Update attention head counts after weight sharding."""
+        """Update attention head counts after sharding.
+
+        shard_linear splits the weight matrices, but the model's n_heads
+        attribute still reflects the original count. We must update it
+        to match the sharded output dimension.
+        """
         inner = self._get_inner_model(model)
-        r = ratio if rank == 0 else (1.0 - ratio)
+        group_size = 2  # world_size
 
         for i, layer in enumerate(inner.layers):
             attn = layer.self_attn
-            is_full = getattr(layer, "layer_type", "") == "full_attention"
             is_k_eq_v = getattr(attn, "use_k_eq_v", False)
 
-            # Q heads: always split
-            original_n_heads = attn.n_heads
-            attn.n_heads = int(original_n_heads * r)
+            # shard_linear with equal split divides by group.size()
+            original_heads = attn.n_heads
+            attn.n_heads = attn.n_heads // group_size
 
-            if is_k_eq_v:
-                # Full K=V layers: KV heads replicated, don't change count
-                pass
-            else:
-                # Sliding layers: KV heads split
-                original_kv = attn.n_kv_heads
-                attn.n_kv_heads = int(original_kv * r)
+            if not is_k_eq_v:
+                attn.n_kv_heads = attn.n_kv_heads // group_size
 
             if i == 0:
                 logger.info(
-                    f"Layer 0 ({'full' if is_full else 'sliding'}): "
-                    f"n_heads {original_n_heads}→{attn.n_heads}, "
-                    f"n_kv_heads {'unchanged' if is_k_eq_v else f'{original_kv}→{attn.n_kv_heads}'}"
+                    f"Layer 0 ({'full' if is_k_eq_v else 'sliding'}): "
+                    f"n_heads {original_heads}→{attn.n_heads}"
                 )
 
     def get_layer_type(self, layer_idx: int, model_config: dict) -> str:
-        """Return 'sliding_attention' or 'full_attention'."""
         layer_types = self._compute_layer_types(model_config)
-        if layer_idx < len(layer_types):
-            return layer_types[layer_idx]
-        return "sliding_attention"
+        return layer_types[layer_idx] if layer_idx < len(layer_types) else "sliding_attention"
 
     def validate_ratio(self, model_config: dict, ratio: float) -> list[str]:
-        """Check that ratio produces valid integer head counts."""
-        errors: list[str] = []
-        num_heads = model_config.get("num_attention_heads", 32)
-        num_kv = model_config.get("num_key_value_heads", 16)
-        intermediate = model_config.get("intermediate_size", 0)
-
-        r0 = ratio
-        r1 = 1.0 - ratio
-
-        for name, dim, r in [
-            ("Q heads (rank 0)", num_heads, r0),
-            ("Q heads (rank 1)", num_heads, r1),
-            ("KV heads (rank 0)", num_kv, r0),
-            ("KV heads (rank 1)", num_kv, r1),
-        ]:
-            count = dim * r
-            if count != int(count) or int(count) <= 0:
-                errors.append(f"{name}: {dim} * {r:.4f} = {count:.4f} (not integer)")
-
-        for name, dim, r in [
-            ("intermediate (rank 0)", intermediate, r0),
-            ("intermediate (rank 1)", intermediate, r1),
-        ]:
-            val = int(dim * r)
-            if val % 8 != 0:
-                errors.append(f"{name}: {val} not divisible by 8")
-
-        return errors
+        # With shard_linear (equal split by group.size()), ratio is informational.
+        # The actual split is always 50/50 for 2 ranks.
+        # TODO: support asymmetric TP with shard_linear
+        return []
 
     def _compute_layer_types(self, model_config: dict) -> list[str]:
-        """Compute per-layer type list from config."""
         num_layers = model_config.get("num_hidden_layers", 60)
-        # Gemma4 uses sliding_window_pattern to determine the repeating pattern.
-        # Config field name varies: sliding_window_pattern or directly layer_types.
         if "layer_types" in model_config:
             return model_config["layer_types"][:num_layers]
-
         pattern_len = model_config.get("sliding_window_pattern", 6)
+        if pattern_len is None:
+            pattern_len = 6
         pattern = ["sliding_attention"] * (pattern_len - 1) + ["full_attention"]
         return (pattern * (num_layers // len(pattern) + 1))[:num_layers]
 
+    def _compute_layer_types_from_model(self, inner) -> list[str]:
+        """Get layer types from the actual model layers."""
+        types = []
+        for layer in inner.layers:
+            lt = getattr(layer, "layer_type", "sliding_attention")
+            types.append(lt)
+        return types
+
     def _get_inner_model(self, model: nn.Module) -> Any:
-        """Extract the Gemma4TextModel from the wrapper.
-
-        Model hierarchy for gemma4 multimodal wrapper:
-          gemma4.Model
-            └── .language_model → gemma4_text.Model
-                  └── .model → Gemma4TextModel (has .layers)
-
-        For gemma4_text directly:
-          gemma4_text.Model
-            └── .model → Gemma4TextModel (has .layers)
-        """
-        # Try gemma4 multimodal wrapper: model.language_model.model
+        """Extract the Gemma4TextModel from the wrapper."""
         lm = getattr(model, "language_model", None)
         if lm is not None:
             inner = getattr(lm, "model", lm)
             if hasattr(inner, "layers"):
                 return inner
-
-        # Try gemma4_text direct: model.model
         inner = getattr(model, "model", None)
         if inner is not None and hasattr(inner, "layers"):
             return inner
-
-        # Model itself has layers
         if hasattr(model, "layers"):
             return model
-
-        raise ValueError(
-            "Cannot find inner Gemma4TextModel with .layers attribute. "
-            f"Model type: {type(model).__name__}"
-        )
-
-
-def _patch_attention_class(attn_cls: type, group: mx.distributed.Group) -> None:
-    """Patch attention class __call__ to add all_sum after o_proj.
-
-    This is applied at the CLASS level because nn.Module.__call__ ignores
-    instance-level overrides. The _tp_group attribute on each instance
-    controls whether all_sum is applied (allows mixed patched/unpatched).
-    """
-    original_call = attn_cls.__call__
-
-    _attn_call_count = [0]
-
-    def patched_call(
-        self: Any,
-        x: mx.array,
-        mask: mx.array | None = None,
-        cache: Any = None,
-        **kwargs: Any,
-    ) -> Any:
-        result = original_call(self, x, mask=mask, cache=cache, **kwargs)
-        grp = getattr(self, "_tp_group", None)
-        if grp is not None:
-            _attn_call_count[0] += 1
-            if _attn_call_count[0] <= 2:
-                logger.info(f"all_sum in Attention (call #{_attn_call_count[0]}, x_shape={x.shape})")
-            # result is (output, (keys, values), offset)
-            if isinstance(result, tuple) and len(result) >= 1:
-                output = mx.distributed.all_sum(result[0], group=grp)
-                return (output,) + result[1:]
-            return mx.distributed.all_sum(result, group=grp)
-        return result
-
-    attn_cls.__call__ = patched_call
-    logger.debug(f"Patched {attn_cls.__name__}.__call__ with all_sum")
-
-
-def _patch_mlp_class(mlp_cls: type, group: mx.distributed.Group) -> None:
-    """Patch MLP class __call__ to add all_sum after down_proj output."""
-    original_call = mlp_cls.__call__
-
-    def patched_call(self: Any, x: mx.array) -> mx.array:
-        result = original_call(self, x)
-        grp = getattr(self, "_tp_group", None)
-        if grp is not None:
-            return mx.distributed.all_sum(result, group=grp)
-        return result
-
-    mlp_cls.__call__ = patched_call
-    logger.debug(f"Patched {mlp_cls.__name__}.__call__ with all_sum")
+        raise ValueError(f"Cannot find layers in model: {type(model).__name__}")
