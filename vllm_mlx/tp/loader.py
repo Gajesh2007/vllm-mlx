@@ -87,20 +87,31 @@ def sharded_load(
     # The safetensors weights are quantized (packed uint with scales/biases).
     # Without quantizing the model first, embeddings return packed dim (1344)
     # instead of the real hidden dim (5376).
-    quant_config = text_config.get("quantization_config", model_config.get("quantization_config"))
-    if quant_config:
-        from mlx.nn import QuantizedLinear, QuantizedEmbedding
+    #
+    # Use the same approach as mlx_lm.utils.load_model: check for "quantization"
+    # key in config, then nn.quantize with class_predicate from model.
+    quantization = model_config.get("quantization") or text_config.get("quantization")
+    if quantization:
+        q_group_size = quantization.get("group_size", 64)
+        q_bits = quantization.get("bits", 8)
+        q_mode = quantization.get("mode", "affine")
 
-        q_group_size = quant_config.get("group_size", 64)
-        q_bits = quant_config.get("bits", 8)
+        def _class_predicate(path: str, m: nn.Module) -> bool | dict:
+            # Check model-level quant_predicate first
+            quant_pred = getattr(model, "quant_predicate", None)
+            if quant_pred is not None:
+                return quant_pred(path, m)
+            # Default: only quantize modules that support it
+            return hasattr(m, "to_quantized")
 
-        # Use the model's quant_predicate if available, otherwise default
-        quant_pred = getattr(model, "quant_predicate", None)
-        if quant_pred:
-            nn.quantize(model, group_size=q_group_size, bits=q_bits, class_predicate=quant_pred)
-        else:
-            nn.quantize(model, group_size=q_group_size, bits=q_bits)
-        logger.info(f"Applied quantization: {q_bits}-bit, group_size={q_group_size}")
+        nn.quantize(
+            model,
+            group_size=q_group_size,
+            bits=q_bits,
+            mode=q_mode,
+            class_predicate=_class_predicate,
+        )
+        logger.info(f"Applied quantization: {q_bits}-bit, group_size={q_group_size}, mode={q_mode}")
 
     # 4. Load sharded weights from safetensors
     weight_files = sorted(model_path.glob("model*.safetensors"))
