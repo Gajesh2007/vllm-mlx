@@ -394,27 +394,39 @@ def serve_command(args):
             llm.tokenizer = tokenizer
             llm._loaded = True
 
-            # Monkey-patch llm.chat and llm.generate to send prompt to rank 1
-            # BEFORE calling the real generate. This is the sync point.
-            _original_generate = llm.generate
-            _original_chat = llm.chat
+            # Replace llm.chat and llm.generate with synchronized TP versions.
+            # Both ranks call model() in exact lockstep. After each decode step,
+            # rank 0 samples a token and sends it to rank 1 via TCP.
+            from .tp.tp_generate import tp_generate
+            from .models.llm import GenerationOutput
+
+            def _send_token(token_id: int) -> None:
+                sync_server.send_token(token_id)
 
             def _tp_generate(prompt, **kwargs):
+                max_tok = kwargs.get("max_tokens", 256)
+                temp = kwargs.get("temperature", 0.0)
+                tp = kwargs.get("top_p", 1.0)
+
                 # Send prompt to rank 1 via TCP
                 sync_server.send_generate(GenerateRequest(
-                    prompt=prompt,
-                    max_tokens=kwargs.get("max_tokens", 256),
-                    temperature=kwargs.get("temperature", 0.0),
-                    top_p=kwargs.get("top_p", 1.0),
+                    prompt=prompt, max_tokens=max_tok,
+                    temperature=temp, top_p=tp,
                 ))
-                return _original_generate(prompt, **kwargs)
+
+                # Run synchronized TP generate
+                text = tp_generate(
+                    model, tokenizer, prompt=prompt,
+                    max_tokens=max_tok, temperature=temp, top_p=tp,
+                    rank=0, sync_send_token=_send_token,
+                )
+                return GenerationOutput(
+                    text=text,
+                    tokens=tokenizer.encode(text) if text else [],
+                    finish_reason="stop",
+                )
 
             def _tp_chat(messages, **kwargs):
-                # Apply chat template to get prompt string.
-                # CRITICAL: both ranks MUST call generate() with the EXACT same
-                # string. If rank 0 calls chat() (which re-templates internally)
-                # and rank 1 calls generate(prompt_str), the token sequences may
-                # differ in length, causing all_sum deadlock.
                 if hasattr(tokenizer, "apply_chat_template"):
                     try:
                         prompt_str = tokenizer.apply_chat_template(
@@ -425,21 +437,11 @@ def serve_command(args):
                 else:
                     prompt_str = str(messages)
 
-                sync_server.send_generate(GenerateRequest(
-                    prompt=prompt_str,
-                    max_tokens=kwargs.get("max_tokens", 256),
-                    temperature=kwargs.get("temperature", 0.0),
-                    top_p=kwargs.get("top_p", 1.0),
-                ))
-                # Call generate with the SAME prompt string we sent to rank 1.
-                # Do NOT call _original_chat — it re-templates and may produce
-                # different tokens, causing all_sum deadlock.
-                # Filter kwargs to only those generate() accepts.
                 gen_kwargs = {
                     k: v for k, v in kwargs.items()
-                    if k in ("max_tokens", "temperature", "top_p", "repetition_penalty", "stop")
+                    if k in ("max_tokens", "temperature", "top_p")
                 }
-                return _original_generate(prompt_str, **gen_kwargs)
+                return _tp_generate(prompt_str, **gen_kwargs)
 
             llm.generate = _tp_generate
             llm.chat = _tp_chat

@@ -85,6 +85,14 @@ class SyncServer:
         self._conn.sendall(struct.pack("!I", len(data)))
         self._conn.sendall(data)
 
+    def send_token(self, token_id: int) -> None:
+        """Send a sampled token to rank 1 (called after each decode step)."""
+        if self._conn is None:
+            raise RuntimeError("Rank 1 not connected")
+        data = json.dumps({"type": "token", "token": token_id}).encode()
+        self._conn.sendall(struct.pack("!I", len(data)))
+        self._conn.sendall(data)
+
     def send_shutdown(self) -> None:
         """Tell rank 1 to shut down."""
         if self._conn is None:

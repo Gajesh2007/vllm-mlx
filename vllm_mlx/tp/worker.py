@@ -83,13 +83,17 @@ class TPBatchWorker:
             self._shutdown()
 
     def _main_loop(self) -> None:
-        """Receive prompts from rank 0 via TCP, call generate() in lockstep."""
-        from mlx_lm import generate as mlx_generate
+        """Receive prompts from rank 0 via TCP, call tp_generate in lockstep."""
+        from vllm_mlx.tp.tp_generate import tp_generate
+
+        def recv_token() -> int:
+            """Receive a sampled token from rank 0 via TCP."""
+            msg = self._sync.recv_message()
+            return msg["token"]
 
         while True:
             self.watchdog.heartbeat()
 
-            # Wait for next message from rank 0 (blocks on TCP recv)
             try:
                 msg = self._sync.recv_message()
             except ConnectionError:
@@ -113,26 +117,21 @@ class TPBatchWorker:
                     f"prompt_len={len(prompt)}, temp={temperature}"
                 )
 
-                # Create sampler matching rank 0's params
-                from mlx_lm.generate import make_sampler
-
-                sampler = make_sampler(temperature, top_p)
-
-                # Call generate — the model's all_sum ops sync with rank 0
                 try:
-                    _output = mlx_generate(
+                    tp_generate(
                         self.model,
                         self.tokenizer,
                         prompt=prompt,
                         max_tokens=max_tokens,
-                        sampler=sampler,
-                        verbose=False,
+                        temperature=temperature,
+                        top_p=top_p,
+                        rank=1,
+                        sync_recv_token=recv_token,
                     )
                     self.watchdog.heartbeat()
-                    logger.info(f"Generate complete: output_len={len(_output) if isinstance(_output, str) else 'N/A'}")
+                    logger.info("Generate complete")
                 except Exception as e:
                     logger.error(f"Generate failed: {e}", exc_info=True)
-                    # Don't crash — try to stay alive for next request
 
     def _start_health_server(self) -> None:
         """Minimal HTTP health endpoint."""
