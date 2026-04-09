@@ -346,31 +346,78 @@ def serve_command(args):
             print("Encrypted all_sum active")
 
         # 7. Branch: server vs worker
+        #
+        # Architecture: TCP for control, RDMA for compute.
+        # Rank 0 sends prompts to rank 1 via TCP sync channel.
+        # Both ranks call mlx_lm.generate() simultaneously.
+        # all_sum in sharded layers is the ONLY RDMA traffic.
+        # Never mix mx.distributed.send/recv with all_sum.
+
         if tp_config.is_server:
-            # Rank 0: Wrap model for TP broadcast, inject into engine, start HTTP
+            # Rank 0: Set up sync channel, inject model into engine, start HTTP
             from .engine.simple import SimpleEngine
             from .engine.adaptive import AdaptiveEngine
             from .models.llm import MLXLanguageModel
-            from .tp.model_wrapper import TPModelWrapper
+            from .tp.sync_channel import SyncServer, GenerateRequest
+
+            # Start TCP sync channel for rank 1
+            sync_port = int(tp_config.peer_address.split(":")[-1]) + 100
+            sync_server = SyncServer(sync_port)
 
             server._tp_config = tp_config
             server._tp_group = group
+            server._tp_sync = sync_server
 
-            # Wrap model: every forward pass now broadcasts inputs to rank 1
-            # before executing. Without this, rank 0 hits all_sum in the first
-            # layer and hangs forever (rank 1 is waiting for recv signals).
-            tp_model = TPModelWrapper(model, group)
-
-            # Build engine around the wrapped, sharded model
+            # Build engine with the sharded model directly (NO wrapper).
+            # The model calls all_sum in its patched layers.
+            # Rank 1 calls the same model at the same time (via TCP prompt sync).
             _model_name = args.served_model_name or args.model
             server._model_name = _model_name
             server._model_path = args.model
             server._default_max_tokens = args.max_tokens
 
             llm = MLXLanguageModel(args.model)
-            llm.model = tp_model
+            llm.model = model  # Direct sharded model, no wrapper
             llm.tokenizer = tokenizer
             llm._loaded = True
+
+            # Monkey-patch llm.chat and llm.generate to send prompt to rank 1
+            # BEFORE calling the real generate. This is the sync point.
+            _original_generate = llm.generate
+            _original_chat = llm.chat
+
+            def _tp_generate(prompt, **kwargs):
+                # Send prompt to rank 1 via TCP
+                sync_server.send_generate(GenerateRequest(
+                    prompt=prompt,
+                    max_tokens=kwargs.get("max_tokens", 256),
+                    temperature=kwargs.get("temperature", 0.0),
+                    top_p=kwargs.get("top_p", 1.0),
+                ))
+                return _original_generate(prompt, **kwargs)
+
+            def _tp_chat(messages, **kwargs):
+                # Apply chat template to get prompt string, send to rank 1
+                if hasattr(tokenizer, "apply_chat_template"):
+                    try:
+                        prompt_str = tokenizer.apply_chat_template(
+                            messages, tokenize=False, add_generation_prompt=True
+                        )
+                    except Exception:
+                        prompt_str = str(messages)
+                else:
+                    prompt_str = str(messages)
+
+                sync_server.send_generate(GenerateRequest(
+                    prompt=prompt_str,
+                    max_tokens=kwargs.get("max_tokens", 256),
+                    temperature=kwargs.get("temperature", 0.0),
+                    top_p=kwargs.get("top_p", 1.0),
+                ))
+                return _original_chat(messages, **kwargs)
+
+            llm.generate = _tp_generate
+            llm.chat = _tp_chat
 
             simple = SimpleEngine(model_name=args.model)
             simple._model = llm
@@ -381,6 +428,13 @@ def serve_command(args):
             asyncio.set_event_loop(loop)
             loop.run_until_complete(engine.start())
             server._engine = engine
+
+            # Wait for rank 1 to connect
+            print("Waiting for rank 1 to connect to sync channel...")
+            if not sync_server.wait_for_worker(timeout=120):
+                print("ERROR: Rank 1 did not connect within 120s")
+                sys.exit(1)
+            print("Rank 1 connected!")
 
             print(f"\nStarting TP server at http://{args.host}:{args.port}")
             uvicorn.run(app, host=args.host, port=args.port, log_level="info")
