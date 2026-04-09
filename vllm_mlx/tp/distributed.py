@@ -87,12 +87,25 @@ def _init_jaccl(tp_config: TPConfig) -> mx.distributed.Group:
 
     os.environ["MLX_IBV_DEVICES"] = dev_file.name
     os.environ["MLX_RANK"] = str(tp_config.rank)
-    os.environ["MLX_JACCL_COORDINATOR"] = tp_config.peer_address
+
+    # JACCL coordinator: rank 0 LISTENS, rank 1 CONNECTS.
+    # peer_address is always the OTHER machine's IP.
+    # For rank 0: coordinator = own IP (bind/listen) — use 0.0.0.0 to bind all interfaces
+    # For rank 1: coordinator = rank 0's IP (connect) — that's our peer_address
+    if tp_config.rank == 0:
+        # Rank 0 listens — bind to all interfaces on the coordinator port
+        port = tp_config.peer_address.split(":")[-1] if ":" in tp_config.peer_address else "19990"
+        coordinator = f"0.0.0.0:{port}"
+    else:
+        # Rank 1 connects to rank 0's address
+        coordinator = tp_config.peer_address
+
+    os.environ["MLX_JACCL_COORDINATOR"] = coordinator
 
     logger.info(
         f"Initializing JACCL backend: rank={tp_config.rank}, "
         f"local_rdma={tp_config.local_rdma}, remote_rdma={tp_config.remote_rdma}, "
-        f"coordinator={tp_config.peer_address}"
+        f"coordinator={coordinator}"
     )
 
     group = mx.distributed.init(backend="jaccl", strict=True)
