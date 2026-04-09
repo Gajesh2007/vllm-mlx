@@ -315,12 +315,24 @@ def serve_command(args):
         strategy.apply_patches(model, group, tp_config.ratio)
         strategy.update_head_counts(model, tp_config.rank, tp_config.ratio)
 
-        # 5b. Load tokenizer ONLY (not the full model — that would reload 33GB)
+        # 5b. Load tokenizer ONLY (not the full model — that would reload 33GB).
+        # load_tokenizer needs an HF repo ID or a path it can resolve.
+        # If user passed a local path, extract the repo ID from the path
+        # structure (~/.cache/huggingface/hub/models--{org}--{name}/...).
         from mlx_lm.utils import load_tokenizer as _load_tok
+        import re as _re
         tokenizer_config = {}
         if "qwen3" in args.model.lower():
             tokenizer_config["eos_token"] = "<|im_end|>"
-        tokenizer = _load_tok(model_path, tokenizer_config_extra=tokenizer_config)
+
+        tok_model_id = args.model
+        # Convert local HF cache path to repo ID
+        cache_match = _re.search(r"models--([^/]+)--([^/]+)", str(args.model))
+        if cache_match:
+            tok_model_id = f"{cache_match.group(1)}/{cache_match.group(2)}"
+            print(f"  Tokenizer repo: {tok_model_id}")
+
+        tokenizer = _load_tok(tok_model_id, tokenizer_config_extra=tokenizer_config)
 
         # 6. Encrypted all_sum (if enabled)
         if tp_config.encrypt:
