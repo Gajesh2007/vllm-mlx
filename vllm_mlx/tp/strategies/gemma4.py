@@ -281,8 +281,9 @@ def _patch_attention_class(attn_cls: type, group: mx.distributed.Group) -> None:
         x: mx.array,
         mask: mx.array | None = None,
         cache: Any = None,
+        **kwargs: Any,
     ) -> Any:
-        result = original_call(self, x, mask=mask, cache=cache)
+        result = original_call(self, x, mask=mask, cache=cache, **kwargs)
         grp = getattr(self, "_tp_group", None)
         if grp is not None:
             # result is (output, (keys, values), offset)
