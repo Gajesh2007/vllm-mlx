@@ -97,7 +97,7 @@ def sharded_load(
         # Use the model's quant_predicate if available, otherwise default
         quant_pred = getattr(model, "quant_predicate", None)
         if quant_pred:
-            nn.quantize(model, group_size=q_group_size, bits=q_bits, predicate=quant_pred)
+            nn.quantize(model, group_size=q_group_size, bits=q_bits, class_predicate=quant_pred)
         else:
             nn.quantize(model, group_size=q_group_size, bits=q_bits)
         logger.info(f"Applied quantization: {q_bits}-bit, group_size={q_group_size}")
