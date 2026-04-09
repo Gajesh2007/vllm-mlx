@@ -114,7 +114,7 @@ class TPBatchWorker:
                 )
 
                 # Create sampler matching rank 0's params
-                from mlx_lm.utils import make_sampler
+                from mlx_lm.generate import make_sampler
 
                 sampler = make_sampler(temperature, top_p)
 
