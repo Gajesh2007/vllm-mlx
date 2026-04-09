@@ -29,7 +29,7 @@ class TestGemma4ShardingMap:
     def test_q_proj_is_column_parallel(self) -> None:
         """Q projection should be column-parallel on all layers."""
         for i in range(60):
-            key = f"model.layers.{i}.self_attn.q_proj.weight"
+            key = f"language_model.model.layers.{i}.self_attn.q_proj.weight"
             spec = self.shard_map[key]
             assert spec.strategy == "column"
             assert spec.axis == 0
@@ -39,27 +39,27 @@ class TestGemma4ShardingMap:
         """Sliding layer K/V should be column-parallel (split by KV heads)."""
         # Layer 0 is sliding
         for proj in ("k_proj", "v_proj"):
-            key = f"model.layers.0.self_attn.{proj}.weight"
+            key = f"language_model.model.layers.0.self_attn.{proj}.weight"
             spec = self.shard_map[key]
             assert spec.strategy == "column"
 
     def test_full_kv_is_replicated(self) -> None:
         """Full attention K is replicated (K=V, only 4 heads)."""
         # Layer 5 is full (pattern=6: 0-4 sliding, 5 full)
-        key = "model.layers.5.self_attn.k_proj.weight"
+        key = "language_model.model.layers.5.self_attn.k_proj.weight"
         spec = self.shard_map[key]
         assert spec.strategy == "replicate"
 
     def test_full_layer_no_v_proj(self) -> None:
         """Full attention layers with K=V should not have v_proj in map."""
         # Layer 5 is full with K=V
-        key = "model.layers.5.self_attn.v_proj.weight"
+        key = "language_model.model.layers.5.self_attn.v_proj.weight"
         assert key not in self.shard_map
 
     def test_o_proj_is_row_parallel(self) -> None:
         """O projection should be row-parallel on all layers."""
         for i in range(60):
-            key = f"model.layers.{i}.self_attn.o_proj.weight"
+            key = f"language_model.model.layers.{i}.self_attn.o_proj.weight"
             spec = self.shard_map[key]
             assert spec.strategy == "row"
             assert spec.axis == -1
@@ -67,25 +67,25 @@ class TestGemma4ShardingMap:
     def test_mlp_gate_up_column_parallel(self) -> None:
         """MLP gate/up should be column-parallel."""
         for proj in ("gate_proj", "up_proj"):
-            key = f"model.layers.0.mlp.{proj}.weight"
+            key = f"language_model.model.layers.0.mlp.{proj}.weight"
             spec = self.shard_map[key]
             assert spec.strategy == "column"
 
     def test_mlp_down_row_parallel(self) -> None:
         """MLP down should be row-parallel."""
-        key = "model.layers.0.mlp.down_proj.weight"
+        key = "language_model.model.layers.0.mlp.down_proj.weight"
         spec = self.shard_map[key]
         assert spec.strategy == "row"
 
     def test_embeddings_replicated(self) -> None:
-        key = "model.embed_tokens.weight"
+        key = "language_model.model.embed_tokens.weight"
         spec = self.shard_map[key]
         assert spec.strategy == "replicate"
 
     def test_norms_replicated(self) -> None:
         """All norms should be replicated."""
         for key, spec in self.shard_map.items():
-            if "layernorm" in key or key == "model.norm.weight":
+            if "layernorm" in key or key == "language_model.model.norm.weight":
                 assert spec.strategy == "replicate", f"{key} should be replicated"
 
 

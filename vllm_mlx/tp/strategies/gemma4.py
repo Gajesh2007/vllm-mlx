@@ -48,7 +48,7 @@ class Gemma4Strategy(ShardingStrategy):
         shard_map: dict[str, ShardSpec] = {}
 
         for i in range(num_layers):
-            prefix = f"model.layers.{i}"
+            prefix = f"language_model.model.layers.{i}"
             is_full = layer_types[i] == "full_attention"
             is_k_eq_v = k_eq_v and is_full
 
@@ -106,9 +106,9 @@ class Gemma4Strategy(ShardingStrategy):
             shard_map[key] = ShardSpec(strategy="replicate")
 
         # Embeddings: replicate (shared across ranks, used for both input + lm_head)
-        shard_map["model.embed_tokens.weight"] = ShardSpec(strategy="replicate")
+        shard_map["language_model.model.embed_tokens.weight"] = ShardSpec(strategy="replicate")
         # Final norm: replicate
-        shard_map["model.norm.weight"] = ShardSpec(strategy="replicate")
+        shard_map["language_model.model.norm.weight"] = ShardSpec(strategy="replicate")
 
         return shard_map
 
