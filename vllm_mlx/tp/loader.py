@@ -70,12 +70,38 @@ def sharded_load(
         f"sharded, {sum(1 for s in shard_map.values() if s.strategy == 'replicate')} replicated"
     )
 
-    # 3. Load model with mlx_lm to get proper quantized structure.
-    # lazy=True: weights are mmap'd, not in GPU memory yet.
-    from mlx_lm.utils import load_model as _load_model
+    # 3. Build model architecture WITHOUT loading weights.
+    # We create the model structure, apply quantization (to get QuantizedLinear/
+    # QuantizedEmbedding layer types), then load only our sharded portion
+    # of the weights from safetensors files.
+    #
+    # DO NOT use load_model(lazy=True) — it creates 33.8 GB of lazy weight
+    # refs that compete with our sharded weights for GPU memory.
+    from mlx_lm.utils import _get_classes
 
-    model, loaded_config = _load_model(model_path, lazy=True, strict=False)
-    logger.info(f"Model loaded lazily: {type(model).__name__}")
+    model_class, model_args_class = _get_classes(config=model_config)
+    model_args = model_args_class.from_dict(model_config)
+    model = model_class(model_args)
+
+    # Apply quantization to convert Linear→QuantizedLinear etc.
+    quantization = model_config.get("quantization") or text_config.get("quantization")
+    if quantization:
+        def _qpred(path: str, m: nn.Module) -> bool | dict:
+            if not hasattr(m, "to_quantized"):
+                return False
+            qp = getattr(model, "quant_predicate", None)
+            return qp(path, m) if qp else True
+
+        nn.quantize(
+            model,
+            group_size=quantization.get("group_size", 64),
+            bits=quantization.get("bits", 8),
+            mode=quantization.get("mode", "affine"),
+            class_predicate=_qpred,
+        )
+        logger.info(f"Quantized: {quantization.get('bits')}-bit")
+
+    logger.info(f"Model built: {type(model).__name__} (no weights loaded yet)")
 
     # 4. Replace weights with sharded versions loaded from safetensors.
     #
