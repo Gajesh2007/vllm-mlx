@@ -43,12 +43,12 @@ class TestGemma4ShardingMap:
             spec = self.shard_map[key]
             assert spec.strategy == "column"
 
-    def test_full_kv_is_replicated(self) -> None:
-        """Full attention K is replicated (K=V, only 4 heads)."""
+    def test_full_kv_is_column_parallel(self) -> None:
+        """Full attention K is column-parallel (must shard to preserve GQA ratio)."""
         # Layer 5 is full (pattern=6: 0-4 sliding, 5 full)
         key = "language_model.model.layers.5.self_attn.k_proj.weight"
         spec = self.shard_map[key]
-        assert spec.strategy == "replicate"
+        assert spec.strategy == "column"
 
     def test_full_layer_no_v_proj(self) -> None:
         """Full attention layers with K=V should not have v_proj in map."""

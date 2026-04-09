@@ -55,16 +55,14 @@ class Gemma4Strategy(ShardingStrategy):
                     strategy="column", axis=0, ratio=ratio
                 )
 
-            # K: column-parallel for sliding, replicate for full (K=V, too few heads)
+            # K: ALWAYS column-parallel. Even on K=V full attention layers,
+            # K must be sharded to preserve GQA ratio (n_heads/n_kv_heads).
             for suffix in ("weight", "scales", "biases"):
-                if is_k_eq_v:
-                    shard_map[f"{prefix}.self_attn.k_proj.{suffix}"] = ShardSpec(strategy="replicate")
-                else:
-                    shard_map[f"{prefix}.self_attn.k_proj.{suffix}"] = ShardSpec(
-                        strategy="column", axis=0, ratio=ratio
-                    )
+                shard_map[f"{prefix}.self_attn.k_proj.{suffix}"] = ShardSpec(
+                    strategy="column", axis=0, ratio=ratio
+                )
 
-            # V: only on sliding layers
+            # V: only on sliding layers (K=V layers don't have v_proj)
             if not is_k_eq_v:
                 for suffix in ("weight", "scales", "biases"):
                     shard_map[f"{prefix}.self_attn.v_proj.{suffix}"] = ShardSpec(
@@ -139,11 +137,14 @@ class Gemma4Strategy(ShardingStrategy):
             # Q: all-to-sharded (each rank gets partial heads)
             attn.q_proj = shard_linear(attn.q_proj, "all-to-sharded", group=group)
 
-            # K/V: all-to-sharded for sliding, leave as-is for full (K=V, replicated)
-            if not is_k_eq_v_layer:
-                attn.k_proj = shard_linear(attn.k_proj, "all-to-sharded", group=group)
-                if hasattr(attn, "v_proj"):
-                    attn.v_proj = shard_linear(attn.v_proj, "all-to-sharded", group=group)
+            # K/V: MUST shard K on ALL layers (including K=V full attention).
+            # Reason: GQA maps Q heads to KV heads using n_heads/n_kv_heads ratio.
+            # If we shard Q (32→16) but leave K unsharded (4), the ratio changes
+            # from 8:1 to 4:1, causing Q heads to attend to WRONG KV heads.
+            # Sharding K (4→2) preserves the 8:1 ratio.
+            attn.k_proj = shard_linear(attn.k_proj, "all-to-sharded", group=group)
+            if hasattr(attn, "v_proj"):
+                attn.v_proj = shard_linear(attn.v_proj, "all-to-sharded", group=group)
 
             # O: sharded-to-all (recombines via all_sum internally)
             attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
@@ -187,11 +188,12 @@ class Gemma4Strategy(ShardingStrategy):
             is_k_eq_v = getattr(attn, "use_k_eq_v", False)
 
             # shard_linear with equal split divides by group.size()
+            # MUST update BOTH n_heads AND n_kv_heads on ALL layers to
+            # preserve the GQA ratio (n_heads/n_kv_heads). Otherwise,
+            # mx.fast.scaled_dot_product_attention maps Q heads to wrong KV heads.
             original_heads = attn.n_heads
             attn.n_heads = attn.n_heads // group_size
-
-            if not is_k_eq_v:
-                attn.n_kv_heads = attn.n_kv_heads // group_size
+            attn.n_kv_heads = attn.n_kv_heads // group_size
 
             if i == 0:
                 logger.info(
