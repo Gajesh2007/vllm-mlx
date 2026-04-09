@@ -73,9 +73,13 @@ def sharded_load(
     # 3. Build model architecture (weights will be loaded below)
     from mlx_lm.utils import _get_classes, load_model
 
-    # Determine model class from config
+    # Determine model class from config.
+    # IMPORTANT: pass the FULL config to from_dict(), not text_config.
+    # For multimodal wrappers (gemma4), ModelArgs reads text_config as
+    # a nested dict. Passing text_config directly makes it empty, causing
+    # wrong default head counts (8/1 instead of 32/16).
     model_class, model_args_class = _get_classes(config=model_config)
-    model_args = model_args_class.from_dict(text_config)
+    model_args = model_args_class.from_dict(model_config)
     model = model_class(model_args)
 
     # 4. Load sharded weights from safetensors

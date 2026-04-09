@@ -18,8 +18,10 @@ import sys
 
 def serve_command(args):
     """Start the OpenAI-compatible server."""
+    import asyncio
     import logging
     import os
+    import signal
     import sys
 
     import uvicorn
@@ -272,7 +274,6 @@ def serve_command(args):
         # Wrap entire TP setup in try/except for graceful exit.
         # GPU memory leaks if we crash during Metal compute — os._exit(0)
         # is the only safe cleanup on Apple Silicon.
-        import signal
         signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
         signal.signal(signal.SIGINT, lambda *_: os._exit(0))
 

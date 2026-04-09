@@ -234,16 +234,36 @@ class Gemma4Strategy(ShardingStrategy):
         return (pattern * (num_layers // len(pattern) + 1))[:num_layers]
 
     def _get_inner_model(self, model: nn.Module) -> Any:
-        """Extract the Gemma4TextModel from the wrapper."""
-        # model.model is Gemma4TextModel
+        """Extract the Gemma4TextModel from the wrapper.
+
+        Model hierarchy for gemma4 multimodal wrapper:
+          gemma4.Model
+            └── .language_model → gemma4_text.Model
+                  └── .model → Gemma4TextModel (has .layers)
+
+        For gemma4_text directly:
+          gemma4_text.Model
+            └── .model → Gemma4TextModel (has .layers)
+        """
+        # Try gemma4 multimodal wrapper: model.language_model.model
+        lm = getattr(model, "language_model", None)
+        if lm is not None:
+            inner = getattr(lm, "model", lm)
+            if hasattr(inner, "layers"):
+                return inner
+
+        # Try gemma4_text direct: model.model
         inner = getattr(model, "model", None)
         if inner is not None and hasattr(inner, "layers"):
             return inner
-        # If model itself has layers (already unwrapped)
+
+        # Model itself has layers
         if hasattr(model, "layers"):
             return model
+
         raise ValueError(
-            "Cannot find inner Gemma4TextModel with .layers attribute"
+            "Cannot find inner Gemma4TextModel with .layers attribute. "
+            f"Model type: {type(model).__name__}"
         )
 
 
