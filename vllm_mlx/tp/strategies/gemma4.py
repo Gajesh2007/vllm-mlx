@@ -276,6 +276,8 @@ def _patch_attention_class(attn_cls: type, group: mx.distributed.Group) -> None:
     """
     original_call = attn_cls.__call__
 
+    _attn_call_count = [0]
+
     def patched_call(
         self: Any,
         x: mx.array,
@@ -286,8 +288,10 @@ def _patch_attention_class(attn_cls: type, group: mx.distributed.Group) -> None:
         result = original_call(self, x, mask=mask, cache=cache, **kwargs)
         grp = getattr(self, "_tp_group", None)
         if grp is not None:
+            _attn_call_count[0] += 1
+            if _attn_call_count[0] <= 2:
+                logger.info(f"all_sum in Attention (call #{_attn_call_count[0]}, x_shape={x.shape})")
             # result is (output, (keys, values), offset)
-            # Apply all_sum to the output tensor only
             if isinstance(result, tuple) and len(result) >= 1:
                 output = mx.distributed.all_sum(result[0], group=grp)
                 return (output,) + result[1:]

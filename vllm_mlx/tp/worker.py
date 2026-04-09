@@ -108,9 +108,9 @@ class TPBatchWorker:
                 temperature = msg.get("temperature", 0.0)
                 top_p = msg.get("top_p", 1.0)
 
-                logger.debug(
+                logger.info(
                     f"Generating: max_tokens={max_tokens}, "
-                    f"prompt_len={len(prompt)}"
+                    f"prompt_len={len(prompt)}, temp={temperature}"
                 )
 
                 # Create sampler matching rank 0's params
@@ -129,7 +129,7 @@ class TPBatchWorker:
                         verbose=False,
                     )
                     self.watchdog.heartbeat()
-                    logger.debug(f"Generate complete")
+                    logger.info(f"Generate complete: output_len={len(_output) if isinstance(_output, str) else 'N/A'}")
                 except Exception as e:
                     logger.error(f"Generate failed: {e}", exc_info=True)
                     # Don't crash — try to stay alive for next request

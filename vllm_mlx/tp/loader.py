@@ -85,16 +85,25 @@ def sharded_load(
 
     total_loaded = 0
     total_keys = 0
+    n_column = 0
+    n_row = 0
+    n_replicate = 0
+    n_unmatched = 0
     sharded_pairs: list[tuple[str, mx.array]] = []
 
-    for name, param in tree_flatten(model.parameters()):
+    all_params = list(tree_flatten(model.parameters()))
+    logger.info(f"Total model parameters: {len(all_params)}")
+
+    for name, param in all_params:
         spec = shard_map.get(name)
         if spec is None:
-            # Not in shard map — replicate (norms, scalars, unknown)
+            n_unmatched += 1
             arr = param
         elif spec.strategy == "replicate":
+            n_replicate += 1
             arr = param
         elif spec.strategy == "column":
+            n_column += 1
             axis = spec.axis
             dim = param.shape[axis]
             split_point = int(dim * spec.ratio)
@@ -104,6 +113,7 @@ def sharded_load(
                 arr = _mx_slice_axis(param, axis, split_point, dim)
             arr = mx.contiguous(arr)
         elif spec.strategy == "row":
+            n_row += 1
             axis = spec.axis
             if axis < 0:
                 axis = len(param.shape) + axis
@@ -130,7 +140,18 @@ def sharded_load(
     model.load_weights(sharded_pairs, strict=False)
     del sharded_pairs
     gc.collect()
-    logger.info(f"Sharded {total_keys} parameters, {total_loaded / 1e9:.1f} GB total")
+    logger.info(
+        f"Sharded {total_keys} params: "
+        f"{n_column} column, {n_row} row, {n_replicate} replicate, "
+        f"{n_unmatched} unmatched (replicated), {total_loaded / 1e9:.1f} GB"
+    )
+
+    # Log a sample weight to verify sharding
+    from mlx.utils import tree_flatten as _tf
+    for n, p in _tf(model.parameters()):
+        if "layers.0.self_attn.q_proj.weight" in n:
+            logger.info(f"  Sample: {n} shape={p.shape}")
+            break
 
     elapsed = time.perf_counter() - t0
     total_mb = total_loaded / (1024 * 1024)
