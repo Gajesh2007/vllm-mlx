@@ -68,6 +68,16 @@ def tp_generate(
     generated_tokens = []
     t0 = time.perf_counter()
 
+    # Verify all_sum patches are active
+    inner = getattr(model, "language_model", model)
+    inner = getattr(inner, "model", inner)
+    if hasattr(inner, "layers") and len(inner.layers) > 0:
+        has_tp = hasattr(inner.layers[0].self_attn, "_tp_group")
+        grp = getattr(inner.layers[0].self_attn, "_tp_group", None)
+        logger.info(f"TP check: _tp_group set={has_tp}, group={grp}")
+        if not has_tp:
+            logger.error("WARNING: _tp_group NOT set on attention layers! all_sum will not fire!")
+
     # Prefill: process entire prompt
     logits = model(prompt_tokens, cache=cache)
     mx.eval(logits)
