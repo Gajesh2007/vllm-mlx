@@ -262,7 +262,13 @@ def serve_command(args):
         print(f"  Peer: {tp_config.peer_address}")
         print("=" * 60)
 
-        # TP loading path
+        # CRITICAL: Set MLX_METAL_FAST_SYNCH BEFORE any MLX import/usage.
+        # Without this, GPU compute blocks all_reduce operations, causing
+        # 30-second GPU timeout errors. Must be set before Metal initializes.
+        os.environ["MLX_METAL_FAST_SYNCH"] = "1"
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+        # TP loading path — imports AFTER env vars are set
         from pathlib import Path
 
         import gc
@@ -272,12 +278,6 @@ def serve_command(args):
         from .tp.encryption import EncryptedAllSum
         from .tp.loader import sharded_load
         from .tp.worker import TPBatchWorker
-
-        # CRITICAL: Set MLX_METAL_FAST_SYNCH BEFORE any MLX import/usage.
-        # Without this, GPU compute blocks all_reduce operations, causing
-        # 30-second GPU timeout errors. Must be set before Metal initializes.
-        os.environ["MLX_METAL_FAST_SYNCH"] = "1"
-        os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
         # Graceful exit handlers
         signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
@@ -333,8 +333,12 @@ def serve_command(args):
         strategy.apply_patches(model, group, tp_config.ratio)
         strategy.update_head_counts(model, tp_config.rank, tp_config.ratio)
 
-        # 6. Evaluate — materializes only sharded weights to GPU
-        print("Evaluating sharded weights...")
+        # 6. Evaluate remaining non-layer parameters (embeddings, norms).
+        # Layer weights were already evaluated layer-by-layer inside
+        # apply_patches() to prevent OOM from materializing the full
+        # 33.8GB model at once. This call only evals the small remaining
+        # params (~1.3GB embeddings + norms).
+        print("Evaluating remaining parameters (embeddings, norms)...")
         mx.eval(model.parameters())
         gc.collect()
         active_mem = mx.get_active_memory() / 1e9

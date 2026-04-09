@@ -106,46 +106,69 @@ class Gemma4Strategy(ShardingStrategy):
     ) -> set[type]:
         """Replace linear layers with distributed versions using shard_linear.
 
-        This is the MLX-official approach: shard_linear creates
-        AllToShardedLinear / ShardedToAllLinear layers that handle
-        weight splitting AND all_sum internally. No monkey-patching needed.
+        Uses layer-by-layer evaluation to prevent OOM: each layer's lazy weights
+        are materialized from disk, then shard_linear replaces them with
+        distributed versions, then the sharded weights are evaluated. This
+        bounds peak memory to ~one layer instead of the full model.
+
+        Without this, mx.eval(model.parameters()) after shard_linear tries to
+        materialize ALL 33.8GB of lazy weights at once — causing OOM or silent
+        corruption on 36GB machines.
+
+        Pattern from exo's tensor_auto_parallel / LlamaShardingStrategy.
         """
         inner = self._get_inner_model(model)
         layer_types = self._compute_layer_types_from_model(inner)
-
-        k_eq_v = getattr(inner.layers[0].self_attn, "use_k_eq_v", False) if inner.layers else False
+        total = len(inner.layers)
 
         for i, layer in enumerate(inner.layers):
             attn = layer.self_attn
-            is_full = layer_types[i] == "full_attention"
             is_k_eq_v_layer = getattr(attn, "use_k_eq_v", False)
 
-            # Q: all-to-sharded
+            # Step 1: Materialize this layer's lazy weights from disk.
+            # load_model(lazy=True) returns memory-mapped weights (~0 GPU mem).
+            # Eval one layer at a time (~560MB) to avoid materializing the
+            # full 33.8GB model, which OOMs on 36GB machines.
+            mx.eval(layer.parameters())
+
+            # Step 2: Replace linear layers with distributed versions.
+            # shard_linear creates AllToShardedLinear / ShardedToAllLinear
+            # (or QuantizedAllToShardedLinear / QuantizedShardedToAllLinear)
+            # that handle weight splitting AND all_sum internally.
+
+            # Q: all-to-sharded (each rank gets partial heads)
             attn.q_proj = shard_linear(attn.q_proj, "all-to-sharded", group=group)
 
-            # K: all-to-sharded for sliding, leave as-is for full (replicated)
+            # K/V: all-to-sharded for sliding, leave as-is for full (K=V, replicated)
             if not is_k_eq_v_layer:
                 attn.k_proj = shard_linear(attn.k_proj, "all-to-sharded", group=group)
                 if hasattr(attn, "v_proj"):
                     attn.v_proj = shard_linear(attn.v_proj, "all-to-sharded", group=group)
 
-            # O: sharded-to-all (handles all_sum internally)
+            # O: sharded-to-all (recombines via all_sum internally)
             attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
 
-            # MLP
+            # MLP: gate/up split, down recombines
             mlp = layer.mlp
             mlp.gate_proj = shard_linear(mlp.gate_proj, "all-to-sharded", group=group)
             mlp.up_proj = shard_linear(mlp.up_proj, "all-to-sharded", group=group)
             mlp.down_proj = shard_linear(mlp.down_proj, "sharded-to-all", group=group)
+
+            # Step 3: Evaluate sharded weights. This materializes only this
+            # rank's portion (~280MB per layer for 2-way split) and allows
+            # the original full-size weights to be freed by GC.
+            mx.eval(layer)
 
             if i == 0:
                 logger.info(
                     f"Layer 0: q_proj type={type(attn.q_proj).__name__}, "
                     f"o_proj type={type(attn.o_proj).__name__}"
                 )
+            if i % 10 == 0 or i == total - 1:
+                logger.info(f"Sharded layer {i + 1}/{total}")
 
-        logger.info(f"Sharded {len(inner.layers)} layers with shard_linear")
-        return set()  # No class-level patches needed
+        logger.info(f"Sharded {total} layers with shard_linear (layer-by-layer eval)")
+        return set()
 
     def update_head_counts(
         self, model: nn.Module, rank: int, ratio: float
