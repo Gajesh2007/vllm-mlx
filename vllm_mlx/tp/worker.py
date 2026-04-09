@@ -83,13 +83,14 @@ class TPBatchWorker:
             self._shutdown()
 
     def _main_loop(self) -> None:
-        """Receive prompts from rank 0 via TCP, call tp_generate in lockstep."""
-        from vllm_mlx.tp.tp_generate import tp_generate
+        """Receive prompts from rank 0 via TCP, call mlx_lm.generate in lockstep.
 
-        def recv_token() -> int:
-            """Receive a sampled token from rank 0 via TCP."""
-            msg = self._sync.recv_message()
-            return msg["token"]
+        With shard_linear, the distributed layers handle all_sum internally.
+        Both ranks call generate() independently — the blocking all_sum
+        operations force them to proceed in lockstep automatically.
+        No token broadcast needed.
+        """
+        from mlx_lm import generate as mlx_generate
 
         while True:
             self.watchdog.heartbeat()
@@ -118,18 +119,22 @@ class TPBatchWorker:
                 )
 
                 try:
-                    tp_generate(
+                    # Use standard mlx_lm.generate — shard_linear's distributed
+                    # layers handle all_sum automatically. Both ranks produce
+                    # identical logits → identical sampling → identical tokens.
+                    # Must use same random seed for stochastic sampling.
+                    import mlx.core as mx
+                    mx.random.seed(42)
+
+                    _output = mlx_generate(
                         self.model,
                         self.tokenizer,
                         prompt=prompt,
                         max_tokens=max_tokens,
-                        temperature=temperature,
-                        top_p=top_p,
-                        rank=1,
-                        sync_recv_token=recv_token,
+                        verbose=False,
                     )
                     self.watchdog.heartbeat()
-                    logger.info("Generate complete")
+                    logger.info(f"Generate complete: {len(_output)} chars")
                 except Exception as e:
                     logger.error(f"Generate failed: {e}", exc_info=True)
 

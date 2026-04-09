@@ -404,31 +404,29 @@ def serve_command(args):
             llm.tokenizer = tokenizer
             llm._loaded = True
 
-            # Replace llm.chat and llm.generate with synchronized TP versions.
-            # Both ranks call model() in exact lockstep. After each decode step,
-            # rank 0 samples a token and sends it to rank 1 via TCP.
-            from .tp.tp_generate import tp_generate
+            # With shard_linear, both ranks call mlx_lm.generate() independently.
+            # The distributed layers' blocking all_sum keeps them in lockstep.
+            # Rank 0 sends prompt via TCP, both generate, rank 0 returns result.
+            from mlx_lm import generate as mlx_generate
             from .models.llm import GenerationOutput
-
-            def _send_token(token_id: int) -> None:
-                sync_server.send_token(token_id)
 
             def _tp_generate(prompt, **kwargs):
                 max_tok = kwargs.get("max_tokens", 256)
                 temp = kwargs.get("temperature", 0.0)
-                tp = kwargs.get("top_p", 1.0)
 
                 # Send prompt to rank 1 via TCP
                 sync_server.send_generate(GenerateRequest(
                     prompt=prompt, max_tokens=max_tok,
-                    temperature=temp, top_p=tp,
+                    temperature=temp,
                 ))
 
-                # Run synchronized TP generate
-                text = tp_generate(
+                # Same random seed on both ranks for deterministic sampling
+                mx.random.seed(42)
+
+                # Standard mlx_lm.generate — shard_linear handles all_sum
+                text = mlx_generate(
                     model, tokenizer, prompt=prompt,
-                    max_tokens=max_tok, temperature=temp, top_p=tp,
-                    rank=0, sync_send_token=_send_token,
+                    max_tokens=max_tok, verbose=False,
                 )
                 return GenerationOutput(
                     text=text,
