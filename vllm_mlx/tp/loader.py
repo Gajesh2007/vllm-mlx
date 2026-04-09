@@ -70,131 +70,67 @@ def sharded_load(
         f"sharded, {sum(1 for s in shard_map.values() if s.strategy == 'replicate')} replicated"
     )
 
-    # 3. Build model architecture (weights will be loaded below)
-    from mlx_lm.utils import _get_classes, load_model
+    # 3. Load model with mlx_lm (handles quantization, config, everything).
+    # lazy=True means weights are memory-mapped, not materialized to GPU yet.
+    from mlx_lm.utils import load_model as _load_model
 
-    # Determine model class from config.
-    # IMPORTANT: pass the FULL config to from_dict(), not text_config.
-    # For multimodal wrappers (gemma4), ModelArgs reads text_config as
-    # a nested dict. Passing text_config directly makes it empty, causing
-    # wrong default head counts (8/1 instead of 32/16).
-    model_class, model_args_class = _get_classes(config=model_config)
-    model_args = model_args_class.from_dict(model_config)
-    model = model_class(model_args)
+    model, loaded_config = _load_model(model_path, lazy=True, strict=False)
+    logger.info(f"Model loaded lazily: {type(model).__name__}")
 
-    # 3b. Apply quantization to match weight format.
-    # The model was instantiated as non-quantized (regular nn.Linear/Embedding).
-    # The safetensors weights are quantized (packed uint with scales/biases).
-    # Without quantizing the model first, embeddings return packed dim (1344)
-    # instead of the real hidden dim (5376).
-    #
-    # Use the same approach as mlx_lm.utils.load_model: check for "quantization"
-    # key in config, then nn.quantize with class_predicate from model.
-    quantization = model_config.get("quantization") or text_config.get("quantization")
-    if quantization:
-        q_group_size = quantization.get("group_size", 64)
-        q_bits = quantization.get("bits", 8)
-        q_mode = quantization.get("mode", "affine")
-
-        def _class_predicate(path: str, m: nn.Module) -> bool | dict:
-            # Only quantize modules that support it (have to_quantized method)
-            if not hasattr(m, "to_quantized"):
-                return False
-            # Check model-level quant_predicate for per-path overrides
-            quant_pred = getattr(model, "quant_predicate", None)
-            if quant_pred is not None:
-                return quant_pred(path, m)
-            return True
-
-        nn.quantize(
-            model,
-            group_size=q_group_size,
-            bits=q_bits,
-            mode=q_mode,
-            class_predicate=_class_predicate,
-        )
-        logger.info(f"Applied quantization: {q_bits}-bit, group_size={q_group_size}, mode={q_mode}")
-
-    # 4. Load sharded weights from safetensors
-    weight_files = sorted(model_path.glob("model*.safetensors"))
-    if not weight_files:
-        weight_files = sorted(model_path.glob("*.safetensors"))
-    if not weight_files:
-        raise FileNotFoundError(f"No safetensors files in {model_path}")
+    # 4. Shard weights in-place, one layer at a time.
+    # For each parameter, slice it according to the sharding map, eval the
+    # slice (materializes only the sharded portion to GPU), then assign back.
+    # Peak memory ≈ one full layer + accumulated sharded layers.
+    from mlx.utils import tree_flatten, tree_unflatten
 
     total_loaded = 0
     total_keys = 0
+    sharded_pairs: list[tuple[str, mx.array]] = []
 
-    # Load weights per-file to bound peak memory. Each file's weights are
-    # loaded, sharded, eval'd, assigned to the model, then released.
-    #
-    # We use mx.load() which handles bfloat16 natively (numpy cannot).
-    # Then shard each tensor using mx.split/slice operations.
-    # mx.load() returns lazy arrays — they're memory-mapped from safetensors
-    # and only materialize on mx.eval(). We shard before eval so only the
-    # sharded portion materializes.
-    for wf_idx, wf in enumerate(weight_files):
-        file_weights: list[tuple[str, mx.array]] = []
-
-        # mx.load returns dict of lazy mx.arrays (memory-mapped)
-        raw_weights = mx.load(str(wf))
-
-        for key, tensor in raw_weights.items():
-            spec = shard_map.get(key)
-            if spec is None:
-                logger.debug(f"Unknown weight key {key}, replicating")
-                spec = ShardSpec(strategy="replicate")
-
-            shape = tensor.shape
-
-            if spec.strategy == "replicate":
-                arr = tensor
-
-            elif spec.strategy == "column":
-                axis = spec.axis
-                dim = shape[axis]
-                split_point = int(dim * spec.ratio)
-                if tp_config.rank == 0:
-                    arr = _mx_slice_axis(tensor, axis, 0, split_point)
-                else:
-                    arr = _mx_slice_axis(tensor, axis, split_point, dim)
-
-            elif spec.strategy == "row":
-                axis = spec.axis
-                if axis < 0:
-                    axis = len(shape) + axis
-                dim = shape[axis]
-                split_point = int(dim * spec.ratio)
-                if tp_config.rank == 0:
-                    arr = _mx_slice_axis(tensor, axis, 0, split_point)
-                else:
-                    arr = _mx_slice_axis(tensor, axis, split_point, dim)
-
-                # Bias handling: only rank 0 keeps bias for row-parallel
-                is_bias = key.endswith(".bias") or key.endswith(".biases")
-                if is_bias and tp_config.rank != 0:
-                    arr = mx.zeros_like(arr)
+    for name, param in tree_flatten(model.parameters()):
+        spec = shard_map.get(name)
+        if spec is None:
+            # Not in shard map — replicate (norms, scalars, unknown)
+            arr = param
+        elif spec.strategy == "replicate":
+            arr = param
+        elif spec.strategy == "column":
+            axis = spec.axis
+            dim = param.shape[axis]
+            split_point = int(dim * spec.ratio)
+            if tp_config.rank == 0:
+                arr = _mx_slice_axis(param, axis, 0, split_point)
             else:
-                logger.warning(f"Unknown shard strategy {spec.strategy} for {key}")
-                arr = tensor
+                arr = _mx_slice_axis(param, axis, split_point, dim)
+            arr = mx.contiguous(arr)
+        elif spec.strategy == "row":
+            axis = spec.axis
+            if axis < 0:
+                axis = len(param.shape) + axis
+            dim = param.shape[axis]
+            split_point = int(dim * spec.ratio)
+            if tp_config.rank == 0:
+                arr = _mx_slice_axis(param, axis, 0, split_point)
+            else:
+                arr = _mx_slice_axis(param, axis, split_point, dim)
+            arr = mx.contiguous(arr)
+            # Bias: only rank 0 keeps it for row-parallel (all_sum would double)
+            is_bias = name.endswith(".bias") or name.endswith(".biases")
+            if is_bias and tp_config.rank != 0:
+                arr = mx.zeros_like(arr)
+        else:
+            arr = param
 
-            # Force contiguous layout for sharded tensors
-            if spec.strategy != "replicate":
-                arr = mx.contiguous(arr)
+        mx.eval(arr)
+        sharded_pairs.append((name, arr))
+        total_loaded += arr.nbytes
+        total_keys += 1
 
-            mx.eval(arr)  # Materialize to GPU
-            file_weights.append((key, arr))
-            total_loaded += arr.nbytes
-            total_keys += 1
-
-        # Assign this file's weights to model, then release
-        model.load_weights(file_weights, strict=False)
-        del file_weights, raw_weights
-        gc.collect()
-        logger.info(
-            f"Loaded shard {wf_idx + 1}/{len(weight_files)}: "
-            f"{wf.name} ({total_keys} keys, {total_loaded / 1e9:.1f} GB so far)"
-        )
+    # Apply sharded weights back to model
+    model.load_weights(sharded_pairs, strict=False)
+    del sharded_pairs
+    gc.collect()
+    logger.info(f"Sharded {total_keys} parameters, {total_loaded / 1e9:.1f} GB total")
 
     elapsed = time.perf_counter() - t0
     total_mb = total_loaded / (1024 * 1024)
