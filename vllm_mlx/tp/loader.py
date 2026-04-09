@@ -19,7 +19,6 @@ from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from vllm_mlx.tp.config import TPConfig
 from vllm_mlx.tp.strategy import ShardSpec, ShardingStrategy
@@ -89,79 +88,75 @@ def sharded_load(
     total_loaded = 0
     total_keys = 0
 
-    try:
-        from safetensors import safe_open
-    except ImportError:
-        raise ImportError(
-            "safetensors package required for sharded loading. "
-            "Install with: pip install safetensors"
-        )
-
     # Load weights per-file to bound peak memory. Each file's weights are
-    # loaded, eval'd, assigned to the model, then released before the next file.
+    # loaded, sharded, eval'd, assigned to the model, then released.
+    #
+    # We use mx.load() which handles bfloat16 natively (numpy cannot).
+    # Then shard each tensor using mx.split/slice operations.
+    # mx.load() returns lazy arrays — they're memory-mapped from safetensors
+    # and only materialize on mx.eval(). We shard before eval so only the
+    # sharded portion materializes.
     for wf_idx, wf in enumerate(weight_files):
         file_weights: list[tuple[str, mx.array]] = []
 
-        with safe_open(str(wf), framework="numpy") as f:
-            for key in f.keys():
-                spec = shard_map.get(key)
-                if spec is None:
-                    # Unknown weight — replicate by default (norms, scalars, etc.)
-                    logger.debug(f"Unknown weight key {key}, replicating")
-                    spec = ShardSpec(strategy="replicate")
+        # mx.load returns dict of lazy mx.arrays (memory-mapped)
+        raw_weights = mx.load(str(wf))
 
-                sl = f.get_slice(key)
-                shape = sl.get_shape()
+        for key, tensor in raw_weights.items():
+            spec = shard_map.get(key)
+            if spec is None:
+                logger.debug(f"Unknown weight key {key}, replicating")
+                spec = ShardSpec(strategy="replicate")
 
-                if spec.strategy == "replicate":
-                    data = np.array(sl[:])
+            shape = tensor.shape
 
-                elif spec.strategy == "column":
-                    axis = spec.axis
-                    dim = shape[axis]
-                    split_point = int(dim * spec.ratio)
-                    if tp_config.rank == 0:
-                        start, end = 0, split_point
-                    else:
-                        start, end = split_point, dim
-                    data = _slice_along_axis(sl, axis, start, end, shape)
+            if spec.strategy == "replicate":
+                arr = tensor
 
-                elif spec.strategy == "row":
-                    axis = spec.axis
-                    if axis < 0:
-                        axis = len(shape) + axis
-                    dim = shape[axis]
-                    split_point = int(dim * spec.ratio)
-                    if tp_config.rank == 0:
-                        start, end = 0, split_point
-                    else:
-                        start, end = split_point, dim
-                    data = _slice_along_axis(sl, axis, start, end, shape)
-
-                    # Bias handling: only rank 0 keeps bias for row-parallel
-                    # layers to avoid doubling after all_sum.
-                    # Quantized layers use ".biases", non-quantized use ".bias"
-                    is_bias = key.endswith(".bias") or key.endswith(".biases")
-                    if is_bias and tp_config.rank != 0:
-                        data = np.zeros_like(data)
+            elif spec.strategy == "column":
+                axis = spec.axis
+                dim = shape[axis]
+                split_point = int(dim * spec.ratio)
+                if tp_config.rank == 0:
+                    arr = _mx_slice_axis(tensor, axis, 0, split_point)
                 else:
-                    logger.warning(f"Unknown shard strategy {spec.strategy} for {key}")
-                    data = np.array(sl[:])
+                    arr = _mx_slice_axis(tensor, axis, split_point, dim)
 
-                arr = mx.array(data)
-                mx.eval(arr)  # Materialize to GPU, release numpy buffer
-                file_weights.append((key, arr))
-                total_loaded += data.nbytes
-                total_keys += 1
-                del data  # Release numpy immediately
+            elif spec.strategy == "row":
+                axis = spec.axis
+                if axis < 0:
+                    axis = len(shape) + axis
+                dim = shape[axis]
+                split_point = int(dim * spec.ratio)
+                if tp_config.rank == 0:
+                    arr = _mx_slice_axis(tensor, axis, 0, split_point)
+                else:
+                    arr = _mx_slice_axis(tensor, axis, split_point, dim)
 
-        # Assign this file's weights to model, then release the list
+                # Bias handling: only rank 0 keeps bias for row-parallel
+                is_bias = key.endswith(".bias") or key.endswith(".biases")
+                if is_bias and tp_config.rank != 0:
+                    arr = mx.zeros_like(arr)
+            else:
+                logger.warning(f"Unknown shard strategy {spec.strategy} for {key}")
+                arr = tensor
+
+            # Force contiguous layout for sharded tensors
+            if spec.strategy != "replicate":
+                arr = mx.contiguous(arr)
+
+            mx.eval(arr)  # Materialize to GPU
+            file_weights.append((key, arr))
+            total_loaded += arr.nbytes
+            total_keys += 1
+
+        # Assign this file's weights to model, then release
         model.load_weights(file_weights, strict=False)
-        del file_weights
+        del file_weights, raw_weights
         gc.collect()
-        logger.debug(
+        logger.info(
             f"Loaded shard {wf_idx + 1}/{len(weight_files)}: "
-            f"{wf.name} ({total_keys} keys so far)"
+            f"{wf.name} ({total_keys} keys, {total_loaded / 1e9:.1f} GB so far)"
         )
 
     elapsed = time.perf_counter() - t0
@@ -174,17 +169,13 @@ def sharded_load(
     return model, model_config
 
 
-def _slice_along_axis(
-    sl: object, axis: int, start: int, end: int, shape: list[int]
-) -> np.ndarray:
-    """Slice a safetensors slice object along a specific axis.
+def _mx_slice_axis(tensor: mx.array, axis: int, start: int, end: int) -> mx.array:
+    """Slice an MLX array along a specific axis.
 
-    Builds the appropriate index tuple for the given axis. For example,
-    axis=0: sl[start:end, ...]
-    axis=1: sl[:, start:end, ...]
-    axis=-1 (already resolved): sl[..., start:end]
+    Equivalent to tensor[..., start:end, ...] with the slice on the given axis.
+    Uses mx.split approach for lazy-evaluation-friendly slicing.
     """
-    ndim = len(shape)
+    ndim = len(tensor.shape)
     idx: list[slice] = [slice(None)] * ndim
     idx[axis] = slice(start, end)
-    return np.array(sl[tuple(idx)])
+    return tensor[tuple(idx)]
