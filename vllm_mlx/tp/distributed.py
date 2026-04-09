@@ -101,7 +101,7 @@ def _init_jaccl(tp_config: TPConfig) -> mx.distributed.Group:
     logger.info(
         f"Initializing JACCL backend: rank={tp_config.rank}, "
         f"local_rdma={tp_config.local_rdma}, remote_rdma={tp_config.remote_rdma}, "
-        f"coordinator={coordinator}"
+        f"coordinator={tp_config.peer_address}"
     )
 
     group = mx.distributed.init(backend="jaccl", strict=True)
