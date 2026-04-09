@@ -271,6 +271,12 @@ def serve_command(args):
         from .tp.loader import sharded_load
         from .tp.worker import TPBatchWorker
 
+        # CRITICAL: Set MLX_METAL_FAST_SYNCH BEFORE any MLX import/usage.
+        # Without this, GPU compute blocks all_reduce operations, causing
+        # 30-second GPU timeout errors. Must be set before Metal initializes.
+        os.environ["MLX_METAL_FAST_SYNCH"] = "1"
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
         # Graceful exit handlers
         signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
         signal.signal(signal.SIGINT, lambda *_: os._exit(0))
