@@ -119,7 +119,7 @@ _model_path: str | None = (
     None  # Actual model path (for cache dir, not affected by --served-model-name)
 )
 _default_max_tokens: int = 32768
-_default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes)
+_default_timeout: float = 1800.0  # Default request timeout in seconds (30 minutes)
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
 
@@ -2902,8 +2902,8 @@ Examples:
     parser.add_argument(
         "--timeout",
         type=float,
-        default=300.0,
-        help="Default request timeout in seconds (default: 300)",
+        default=1800.0,
+        help="Default request timeout in seconds (default: 1800)",
     )
     parser.add_argument(
         "--rate-limit",
