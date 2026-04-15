@@ -18,7 +18,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import mlx.core as mx
-from mlx_lm.generate import BatchGenerator, GenerationBatch, PromptProcessingBatch
+from mlx_lm.generate import BatchGenerator
 from mlx_lm.sample_utils import make_sampler
 from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
