@@ -1212,12 +1212,11 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
 
     # --- Detailed request logging ---
-    prompt_preview = prompts[0][:200] if prompts else "(empty)"
     prompt_len = sum(len(p) for p in prompts)
     logger.info(
         f"[REQUEST] POST /v1/completions stream={request.stream} "
         f"max_tokens={request.max_tokens} temp={request.temperature} "
-        f"prompt_chars={prompt_len} prompt_preview={prompt_preview!r}"
+        f"prompt_chars={prompt_len}"
     )
 
     if request.stream:
@@ -1333,12 +1332,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     n_msgs = len(request.messages)
     msg_roles = [m.role for m in request.messages]
     total_chars = 0
-    last_user_preview = ""
     for m in request.messages:
         content = m.content if isinstance(m.content, str) else str(m.content)
         total_chars += len(content)
-        if m.role == "user":
-            last_user_preview = content[:300]
     has_tools = bool(request.tools)
     n_tools = len(request.tools) if request.tools else 0
     logger.info(
@@ -1348,7 +1344,6 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         f"total_chars={total_chars} tools={n_tools} "
         f"response_format={request.response_format}"
     )
-    logger.info(f"[REQUEST] last user message preview: {last_user_preview!r}")
 
     # For MLLM models, keep original messages with embedded images
     # (MLLM.chat() extracts images from message content internally)
@@ -2116,12 +2111,9 @@ async def create_anthropic_message(
     # --- Detailed request logging ---
     n_msgs = len(anthropic_request.messages)
     total_chars = 0
-    last_user_preview = ""
     for m in anthropic_request.messages:
         content = m.content if isinstance(m.content, str) else str(m.content)
         total_chars += len(content)
-        if m.role == "user":
-            last_user_preview = content[:300]
     sys_chars = len(anthropic_request.system) if anthropic_request.system else 0
     n_tools = len(anthropic_request.tools) if anthropic_request.tools else 0
     logger.info(
@@ -2130,7 +2122,6 @@ async def create_anthropic_message(
         f"msgs={n_msgs} total_chars={total_chars} system_chars={sys_chars} "
         f"tools={n_tools}"
     )
-    logger.info(f"[REQUEST] last user message preview: {last_user_preview!r}")
 
     # Convert Anthropic request -> OpenAI request
     openai_request = anthropic_to_openai(anthropic_request)
