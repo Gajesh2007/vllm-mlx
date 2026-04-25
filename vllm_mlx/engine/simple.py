@@ -253,9 +253,7 @@ class SimpleEngine(BaseEngine):
             await self.start()
 
         async with self._generation_lock:
-            # Run in thread pool to allow asyncio timeout to work
-            output = await asyncio.to_thread(
-                self._model.generate,
+            output = self._model.generate(
                 prompt=prompt,
                 max_tokens=max_tokens,
                 temperature=temperature,
@@ -606,6 +604,8 @@ class SimpleEngine(BaseEngine):
         # downstream consumers (frontends) can detect the thinking block.
         # The chat template consumes the opening <think> tag as part of the
         # generation prompt, so it never appears in the generated output.
+        # Must prepend to BOTH text (accumulated) and new_text (delta) since
+        # streaming consumers read new_text per-chunk.
         first_token = True
         async for output in self.stream_generate(
             prompt=prompt,
@@ -616,6 +616,7 @@ class SimpleEngine(BaseEngine):
         ):
             if first_token and enable_thinking:
                 output.text = "<think>" + output.text
+                output.new_text = "<think>" + output.new_text
                 first_token = False
             yield output
 
