@@ -442,10 +442,7 @@ class SimpleEngine(BaseEngine):
 
         async with self._generation_lock:
             if self._is_mllm:
-                # For MLLM, use the chat method which handles images/videos
-                # Run in thread pool to allow asyncio timeout to work
-                output = await asyncio.to_thread(
-                    self._model.chat,
+                output = self._model.chat(
                     messages=messages,
                     max_tokens=max_tokens,
                     temperature=temperature,
@@ -460,10 +457,7 @@ class SimpleEngine(BaseEngine):
                     finish_reason=output.finish_reason,
                 )
             else:
-                # For LLM, use the chat method
-                # Run in thread pool to allow asyncio timeout to work
-                output = await asyncio.to_thread(
-                    self._model.chat,
+                output = self._model.chat(
                     messages=messages,
                     max_tokens=max_tokens,
                     temperature=temperature,
@@ -552,19 +546,15 @@ class SimpleEngine(BaseEngine):
                 accumulated_text = ""
                 token_count = 0
 
-                # Run stream_chat in thread pool since it's synchronous
-                def run_stream():
-                    return list(
-                        self._model.stream_chat(
-                            messages=messages,
-                            max_tokens=max_tokens,
-                            temperature=temperature,
-                            tools=template_tools,
-                            **kwargs,
-                        )
+                chunks = list(
+                    self._model.stream_chat(
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        tools=template_tools,
+                        **kwargs,
                     )
-
-                chunks = await asyncio.to_thread(run_stream)
+                )
 
                 for chunk in chunks:
                     token_count += 1
