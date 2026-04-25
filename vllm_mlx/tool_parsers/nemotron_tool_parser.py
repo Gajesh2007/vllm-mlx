@@ -141,26 +141,38 @@ class NemotronToolParser(ToolParser):
     ) -> dict[str, Any] | None:
         """
         Extract tool calls from streaming Nemotron model output.
+
+        Uses tag counting on the accumulated text (not delta_text) so
+        that close tags split across chunk boundaries are still detected.
         """
-        if "<tool_call>" not in current_text:
+        open_count = current_text.count("<tool_call>")
+        if open_count == 0:
             return {"content": delta_text}
 
-        if "</tool_call>" in delta_text:
+        close_count = current_text.count("</tool_call>")
+        prev_close_count = previous_text.count("</tool_call>")
+
+        if open_count > close_count:
+            return None
+
+        if close_count > prev_close_count:
             result = self.extract_tool_calls(current_text)
             if result.tools_called:
-                return {
-                    "tool_calls": [
-                        {
-                            "index": i,
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["name"],
-                                "arguments": tc["arguments"],
-                            },
-                        }
-                        for i, tc in enumerate(result.tool_calls)
-                    ]
-                }
+                new_calls = result.tool_calls[prev_close_count:]
+                if new_calls:
+                    return {
+                        "tool_calls": [
+                            {
+                                "index": prev_close_count + i,
+                                "id": tc["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": tc["name"],
+                                    "arguments": tc["arguments"],
+                                },
+                            }
+                            for i, tc in enumerate(new_calls)
+                        ]
+                    }
 
-        return None
+        return {"content": delta_text}

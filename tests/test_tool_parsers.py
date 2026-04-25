@@ -1160,3 +1160,162 @@ class TestHermesStreamingFixes:
         assert len(emitted_calls) == 2
         assert emitted_calls[0]["function"]["name"] == "func1"
         assert emitted_calls[1]["function"]["name"] == "func2"
+
+
+class TestSplitCloseTagDetection:
+    """Test that parsers detect close tags split across chunk boundaries.
+
+    The nemotron and auto parsers previously checked delta_text for the
+    close tag, which missed tags tokenized as e.g. '</tool' + '_call>'.
+    The fix uses tag counting on accumulated text (current_text vs
+    previous_text), matching the hermes parser's approach.
+    """
+
+    @staticmethod
+    def _stream_chunks(parser, chunks: list[str]):
+        """Feed chunks through a parser and collect emitted tool calls."""
+        accumulated = ""
+        emitted = []
+        for chunk in chunks:
+            prev = accumulated
+            accumulated += chunk
+            r = parser.extract_tool_calls_streaming(
+                previous_text=prev,
+                current_text=accumulated,
+                delta_text=chunk,
+            )
+            if r is not None and "tool_calls" in r:
+                emitted.extend(r["tool_calls"])
+        return emitted
+
+    def test_nemotron_split_close_tag(self):
+        parser = NemotronToolParser()
+        chunks = [
+            "<tool_call><function=get_weather>",
+            '<parameter=city>Paris</parameter></function></tool',
+            "_call>",
+        ]
+        calls = self._stream_chunks(parser, chunks)
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "get_weather"
+
+    def test_nemotron_unsplit_close_tag(self):
+        parser = NemotronToolParser()
+        chunks = [
+            '<tool_call><function=get_weather><parameter=city>Paris</parameter></function></tool_call>',
+        ]
+        calls = self._stream_chunks(parser, chunks)
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "get_weather"
+
+    def test_auto_split_close_tag(self):
+        parser = AutoToolParser()
+        chunks = [
+            '<tool_call>{"name":"g","arguments":{}}</tool',
+            "_call>",
+        ]
+        calls = self._stream_chunks(parser, chunks)
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "g"
+
+    def test_auto_split_close_tag_minimax(self):
+        parser = AutoToolParser()
+        chunks = [
+            '<minimax:tool_call>{"name":"h","arguments":{}}</minimax:tool',
+            "_call>",
+        ]
+        calls = self._stream_chunks(parser, chunks)
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "h"
+
+    def test_hermes_split_close_tag(self):
+        """Hermes already handled this correctly; verify it still does."""
+        parser = HermesToolParser()
+        chunks = [
+            '<tool_call>{"name":"f","arguments":{"x":1}}</tool',
+            "_call>",
+        ]
+        calls = self._stream_chunks(parser, chunks)
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "f"
+
+
+class TestStreamingChunkSerialization:
+    """Test that streaming chunks exclude None fields.
+
+    The root cause of the streaming tool call bug: every content chunk
+    serialized 'tool_calls': null, which the coordinator converted to
+    'tool_calls': [] and agent SDKs interpreted as 'no tools called'.
+    OpenAI's actual API omits the field entirely on content-only deltas.
+    """
+
+    def test_content_chunk_omits_tool_calls(self):
+        from vllm_mlx.api.models import (
+            ChatCompletionChunk,
+            ChatCompletionChunkChoice,
+            ChatCompletionChunkDelta,
+        )
+
+        chunk = ChatCompletionChunk(
+            model="test",
+            choices=[
+                ChatCompletionChunkChoice(
+                    delta=ChatCompletionChunkDelta(content="hello"),
+                )
+            ],
+        )
+        serialized = chunk.model_dump_json(exclude_none=True)
+        parsed = json.loads(serialized)
+        delta = parsed["choices"][0]["delta"]
+
+        assert "content" in delta
+        assert delta["content"] == "hello"
+        assert "tool_calls" not in delta
+        assert "reasoning" not in delta
+
+    def test_tool_calls_chunk_omits_content(self):
+        from vllm_mlx.api.models import (
+            ChatCompletionChunk,
+            ChatCompletionChunkChoice,
+            ChatCompletionChunkDelta,
+        )
+
+        tc = [{"index": 0, "id": "call_1", "type": "function",
+               "function": {"name": "f", "arguments": "{}"}}]
+        chunk = ChatCompletionChunk(
+            model="test",
+            choices=[
+                ChatCompletionChunkChoice(
+                    delta=ChatCompletionChunkDelta(tool_calls=tc),
+                )
+            ],
+        )
+        serialized = chunk.model_dump_json(exclude_none=True)
+        parsed = json.loads(serialized)
+        delta = parsed["choices"][0]["delta"]
+
+        assert "tool_calls" in delta
+        assert len(delta["tool_calls"]) == 1
+        assert "content" not in delta
+
+    def test_role_only_chunk_is_minimal(self):
+        from vllm_mlx.api.models import (
+            ChatCompletionChunk,
+            ChatCompletionChunkChoice,
+            ChatCompletionChunkDelta,
+        )
+
+        chunk = ChatCompletionChunk(
+            model="test",
+            choices=[
+                ChatCompletionChunkChoice(
+                    delta=ChatCompletionChunkDelta(role="assistant"),
+                )
+            ],
+        )
+        serialized = chunk.model_dump_json(exclude_none=True)
+        parsed = json.loads(serialized)
+        delta = parsed["choices"][0]["delta"]
+
+        assert delta == {"role": "assistant"}
+        assert "usage" not in parsed

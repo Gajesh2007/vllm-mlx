@@ -400,7 +400,8 @@ class AutoToolParser(ToolParser):
         """
         Extract tool calls from streaming model output.
 
-        Uses simple heuristics to detect when a tool call might be complete.
+        Uses tag counting on the accumulated text so that close tags
+        split across chunk boundaries are still detected.
         """
         # Check for any tool call markers
         markers = [
@@ -417,24 +418,29 @@ class AutoToolParser(ToolParser):
         if not has_marker:
             return {"content": delta_text}
 
-        # Check for completion markers
+        # Count end markers in accumulated text vs previous text to
+        # detect newly completed tool calls regardless of how the
+        # close tag was tokenized across chunk boundaries.
         end_markers = ["<tool_call|>", "</minimax:tool_call>", "</tool_call>", "</function>", ")]"]
-        if any(m in delta_text for m in end_markers):
-            result = self.extract_tool_calls(current_text)
-            if result.tools_called:
-                return {
-                    "tool_calls": [
-                        {
-                            "index": i,
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["name"],
-                                "arguments": tc["arguments"],
-                            },
-                        }
-                        for i, tc in enumerate(result.tool_calls)
-                    ]
-                }
+        for em in end_markers:
+            cur_count = current_text.count(em)
+            prev_count = previous_text.count(em)
+            if cur_count > prev_count:
+                result = self.extract_tool_calls(current_text)
+                if result.tools_called:
+                    return {
+                        "tool_calls": [
+                            {
+                                "index": i,
+                                "id": tc["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": tc["name"],
+                                    "arguments": tc["arguments"],
+                                },
+                            }
+                            for i, tc in enumerate(result.tool_calls)
+                        ]
+                    }
 
         return None
