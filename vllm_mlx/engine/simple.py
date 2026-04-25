@@ -612,7 +612,11 @@ class SimpleEngine(BaseEngine):
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             prompt += "\nassistant:"
 
-        # Stream generate
+        # Stream generate — prepend <think> tag if thinking is enabled so
+        # downstream consumers (frontends) can detect the thinking block.
+        # The chat template consumes the opening <think> tag as part of the
+        # generation prompt, so it never appears in the generated output.
+        first_token = True
         async for output in self.stream_generate(
             prompt=prompt,
             max_tokens=max_tokens,
@@ -620,6 +624,9 @@ class SimpleEngine(BaseEngine):
             top_p=top_p,
             **kwargs,
         ):
+            if first_token and enable_thinking:
+                output.text = "<think>" + output.text
+                first_token = False
             yield output
 
     async def _stream_generate_specprefill(
